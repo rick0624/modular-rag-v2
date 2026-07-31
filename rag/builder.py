@@ -12,22 +12,29 @@
 
 from __future__ import annotations
 
+import importlib.util
 from dataclasses import dataclass, field as dc_field
+from pathlib import Path
 from typing import Any, Callable
 
 from haystack import Pipeline
+from haystack.components.builders import ChatPromptBuilder
+from haystack.components.joiners import DocumentJoiner
 from haystack.components.preprocessors import (
     DocumentCleaner,
     DocumentSplitter,
     RecursiveDocumentSplitter,
 )
+from haystack.components.rankers import LLMRanker
 from haystack.components.writers import DocumentWriter
+from haystack.dataclasses import ChatMessage
 from haystack.document_stores.in_memory import InMemoryDocumentStore
 from haystack.document_stores.types import DuplicatePolicy
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from rag.compatibility import (
     validate_chunking_compatibility,
+    validate_inference_compatibility,
     validate_ingestion_compatibility,
 )
 from rag.components.api_embedders import (
@@ -35,9 +42,18 @@ from rag.components.api_embedders import (
     FlexibleAPITextEmbedder,
 )
 from rag.components.file_lister import FileLister
+from rag.components.fusion import SubqueryFusion
+from rag.components.gateway_generator import GatewayChatGenerator, MockChatGenerator
 from rag.components.meta_stamper import ChunkMetaStamper
 from rag.components.mock_embedders import MockDocumentEmbedder, MockTextEmbedder
-from rag.config import MethodConfig, RAGConfig
+from rag.components.multi_query import MultiQueryRetrievalStage
+from rag.components.query_transforms import (
+    DEFAULT_DECOMPOSE_PROMPT,
+    GlossaryExpander,
+    LLMQueryDecomposer,
+    QueryNormalizer,
+)
+from rag.config import FusionConfig, MethodConfig, RAGConfig
 from rag.errors import ConfigError, MissingDependencyError, UnknownMethodError
 
 # 輸入輸出同型別、支援方法鏈(method 清單)的槽位。
@@ -503,3 +519,645 @@ def build_ingestion_pipeline(
     for upstream, downstream in zip(docs_chain, docs_chain[1:]):
         pipeline.connect(f"{upstream}.documents", f"{downstream}.documents")
     return pipeline, store
+
+
+# ---------------------------------------------------------------------------
+# Inference 槽位的 factories
+# ---------------------------------------------------------------------------
+
+# 預設 prompt 模板(Jinja2):切片帶 [chunk_id] 前綴,引用可回溯;
+# glossary_notes 由 glossary 方法提供,未接線時渲染為空。
+DEFAULT_PROMPT_TEMPLATE = """\
+根據以下內容回答問題:
+{% for doc in documents %}[{{ doc.meta.chunk_id }}] {{ doc.content }}
+{% if not loop.last %}---
+{% endif %}{% endfor %}
+{% if glossary_notes %}術語說明:
+{{ glossary_notes }}
+{% endif %}問題:{{ query }}"""
+
+
+class _GenCommonParams(BaseParams):
+    """所有 generation 方法共用的 prompt 參數。"""
+
+    prompt_template: str | None = Field(
+        default=None,
+        description="Jinja2 prompt 模板(可用 {{ query }}、{{ documents }}、"
+        "{{ glossary_notes }});未設定時使用內建模板",
+    )
+    system_prompt: str | None = Field(default=None, description="system 角色訊息(選填)")
+
+
+class _MockGenParams(_GenCommonParams):
+    replies: list[str] | None = Field(
+        default=None, description="腳本化回覆(依序循環);未設定時回覆可辨識的假答案"
+    )
+
+
+def _build_mock_generator(raw: dict[str, Any], ctx: BuildContext) -> tuple[Any, Any, Any]:
+    p = _validate_params("generation", "mock", _MockGenParams, raw)
+    return (MockChatGenerator(replies=p.replies), p.prompt_template, p.system_prompt)
+
+
+class _OpenAIGenParams(_GenCommonParams):
+    model: str = Field(default="gpt-5-mini", description="OpenAI 模型名稱")
+    api_key: str | None = Field(
+        default=None, description="API key;未設定時使用 OPENAI_API_KEY 環境變數"
+    )
+    api_base_url: str | None = Field(
+        default=None, description="替代的 base URL(vLLM / Ollama / 代理閘道等)"
+    )
+    temperature: float | None = Field(default=None, ge=0)
+    max_tokens: int | None = Field(default=None, gt=0)
+    timeout: float | None = Field(default=None, gt=0)
+
+
+def _build_openai_generator(
+    raw: dict[str, Any], ctx: BuildContext
+) -> tuple[Any, Any, Any]:
+    from haystack.components.generators.chat import OpenAIChatGenerator
+    from haystack.utils import Secret
+
+    p = _validate_params("generation", "openai", _OpenAIGenParams, raw)
+    api_key = (
+        Secret.from_token(p.api_key)
+        if p.api_key
+        else Secret.from_env_var("OPENAI_API_KEY")
+    )
+    generation_kwargs: dict[str, Any] = {}
+    if p.temperature is not None:
+        generation_kwargs["temperature"] = p.temperature
+    if p.max_tokens is not None:
+        generation_kwargs["max_tokens"] = p.max_tokens
+    generator = OpenAIChatGenerator(
+        api_key=api_key,
+        model=p.model,
+        api_base_url=p.api_base_url,
+        generation_kwargs=generation_kwargs or None,
+        timeout=p.timeout,
+    )
+    return (generator, p.prompt_template, p.system_prompt)
+
+
+class _GatewayGenParams(_GenCommonParams):
+    base_url: str = Field(description="API base URL,例如 https://llm.example.com/v1")
+    api_key: str | None = Field(
+        default=None, description="API key;建議用 ${ENV_VAR} 由環境變數注入"
+    )
+    model: str | None = Field(
+        default=None,
+        description="模型名稱;不設定時請求不帶 model 欄位(適用於內部閘道)",
+    )
+    temperature: float | None = Field(default=None, ge=0)
+    max_tokens: int | None = Field(default=None, gt=0)
+    timeout: float = Field(default=60.0, gt=0)
+    headers: dict[str, str] = Field(default_factory=dict)
+    completions_path: str = Field(default="/chat/completions")
+
+
+def _build_gateway_generator(
+    raw: dict[str, Any], ctx: BuildContext
+) -> tuple[Any, Any, Any]:
+    p = _validate_params(
+        "generation", "gateway_openai_compatible", _GatewayGenParams, raw
+    )
+    generator = GatewayChatGenerator(
+        base_url=p.base_url,
+        api_key=p.api_key,
+        model=p.model,
+        temperature=p.temperature,
+        max_tokens=p.max_tokens,
+        timeout=p.timeout,
+        headers=p.headers,
+        completions_path=p.completions_path,
+    )
+    return (generator, p.prompt_template, p.system_prompt)
+
+
+GENERATION_FACTORIES: dict[str, SlotFactory] = {
+    "mock": SlotFactory(build=_build_mock_generator),
+    "openai": SlotFactory(build=_build_openai_generator),
+    "gateway_openai_compatible": SlotFactory(build=_build_gateway_generator),
+}
+
+
+def _chat_generator_from_block(
+    where: str, block: dict[str, Any] | None, ctx: BuildContext
+) -> Any:
+    """為 llm_decompose / llm rerank 建立 chat generator。
+
+    ``block`` 形如 ``{method: mock|openai|gateway_openai_compatible, params: {...}}``;
+    未提供時沿用 generation 槽位的設定(同一個 LLM,各自新實例)。
+    """
+    if block is None:
+        if ctx.generation_config is None:
+            raise ConfigError(
+                f"{where} 需要 chat generator:請在 params.generator 指定,"
+                "或提供 generation 槽位設定供沿用"
+            )
+        method = ctx.generation_config.methods()[0]
+        factory = _resolve("generation", GENERATION_FACTORIES, method)
+        generator, _, _ = factory.build(ctx.generation_config.params_for(method), ctx)
+        return generator
+    if not isinstance(block, dict) or "method" not in block:
+        raise ConfigError(
+            f"{where} 的 params.generator 必須是 {{method, params}} 形式的物件,"
+            f"實際得到:{block!r}"
+        )
+    method = block["method"]
+    factory = _resolve("generation", GENERATION_FACTORIES, method)
+    generator, _, _ = factory.build(dict(block.get("params") or {}), ctx)
+    return generator
+
+
+class _NormalizeParams(BaseParams):
+    lowercase: bool = Field(default=True, description="是否把拉丁字母轉為小寫")
+
+
+def _build_normalize(raw: dict[str, Any], ctx: BuildContext) -> Any:
+    p = _validate_params("query_transformation", "normalize", _NormalizeParams, raw)
+    return QueryNormalizer(lowercase=p.lowercase)
+
+
+class _GlossaryParams(BaseParams):
+    glossary: dict[str, str] | None = Field(
+        default=None, description="行內術語表(術語: 定義)"
+    )
+    glossary_path: str | None = Field(
+        default=None, description="術語表 YAML 檔路徑(格式:術語: 定義)"
+    )
+    expand_query: bool = Field(
+        default=False, description="是否把命中的術語定義附加到查詢文字"
+    )
+
+
+def _build_glossary(raw: dict[str, Any], ctx: BuildContext) -> Any:
+    p = _validate_params("query_transformation", "glossary", _GlossaryParams, raw)
+    return GlossaryExpander(
+        glossary=p.glossary, glossary_path=p.glossary_path, expand_query=p.expand_query
+    )
+
+
+class _DecomposeParams(BaseParams):
+    max_subqueries: int = Field(default=4, gt=1, description="子查詢數上限")
+    prompt: str = Field(
+        default=DEFAULT_DECOMPOSE_PROMPT, description="拆解 prompt(含 {{ query }})"
+    )
+    generator: dict[str, Any] | None = Field(
+        default=None,
+        description="拆解用的 chat generator({method, params});"
+        "未設定時沿用 generation 槽位",
+    )
+
+
+def _build_llm_decompose(raw: dict[str, Any], ctx: BuildContext) -> Any:
+    p = _validate_params("query_transformation", "llm_decompose", _DecomposeParams, raw)
+    chat_generator = _chat_generator_from_block(
+        "query_transformation 方法 'llm_decompose'", p.generator, ctx
+    )
+    return LLMQueryDecomposer(
+        chat_generator=chat_generator,
+        prompt=p.prompt,
+        max_subqueries=p.max_subqueries,
+    )
+
+
+class _PassthroughParams(BaseParams):
+    pass
+
+
+def _build_passthrough(raw: dict[str, Any], ctx: BuildContext) -> None:
+    _validate_params("query_transformation", "passthrough", _PassthroughParams, raw)
+    return None
+
+
+TRANSFORM_FACTORIES: dict[str, SlotFactory] = {
+    "passthrough": SlotFactory(build=_build_passthrough),
+    "normalize": SlotFactory(build=_build_normalize),
+    "glossary": SlotFactory(build=_build_glossary),
+    "llm_decompose": SlotFactory(build=_build_llm_decompose),
+}
+
+
+class _SimilarityRankerParams(BaseParams):
+    model: str = Field(
+        default="cross-encoder/ms-marco-MiniLM-L-6-v2", description="cross-encoder 模型"
+    )
+    top_k: int = Field(default=10, gt=0)
+
+
+def _build_similarity_ranker(raw: dict[str, Any], ctx: BuildContext) -> Any:
+    p = _validate_params("reranking", "similarity", _SimilarityRankerParams, raw)
+    try:
+        # 2.32 起 sentence-transformers 元件移出 core,優先從整合套件 import。
+        from haystack_integrations.components.rankers.sentence_transformers import (
+            SentenceTransformersSimilarityRanker,
+        )
+    except ImportError:
+        if importlib.util.find_spec("sentence_transformers") is None:
+            raise MissingDependencyError(
+                "sentence-transformers-haystack", "reranking 方法 'similarity'"
+            ) from None
+        from haystack.components.rankers import SentenceTransformersSimilarityRanker
+    return SentenceTransformersSimilarityRanker(model=p.model, top_k=p.top_k)
+
+
+class _LLMRerankParams(BaseParams):
+    top_k: int = Field(default=5, gt=0)
+    generator: dict[str, Any] | None = Field(
+        default=None,
+        description="重排用的 chat generator({method, params});"
+        "未設定時沿用 generation 槽位",
+    )
+
+
+def _build_llm_ranker(raw: dict[str, Any], ctx: BuildContext) -> Any:
+    p = _validate_params("reranking", "llm", _LLMRerankParams, raw)
+    # 注意:LLMRanker 不傳 chat_generator 會在 init 時建 OpenAIChatGenerator
+    # (要求 OPENAI_API_KEY);builder 一律顯式傳入。
+    chat_generator = _chat_generator_from_block(
+        "reranking 方法 'llm'", p.generator, ctx
+    )
+    return LLMRanker(chat_generator=chat_generator, top_k=p.top_k)
+
+
+class _NoRerankParams(BaseParams):
+    pass
+
+
+def _build_no_rerank(raw: dict[str, Any], ctx: BuildContext) -> None:
+    _validate_params("reranking", "none", _NoRerankParams, raw)
+    return None
+
+
+RERANKING_FACTORIES: dict[str, SlotFactory] = {
+    "none": SlotFactory(build=_build_no_rerank),
+    "similarity": SlotFactory(build=_build_similarity_ranker),
+    "llm": SlotFactory(build=_build_llm_ranker),
+}
+
+
+@dataclass
+class _RetrievalGraph:
+    """retrieval 方法展開後的內部圖片段。"""
+
+    components: dict[str, Any]
+    connections: list[tuple[str, str]]
+    query_targets: list[tuple[str, str]]
+    output: str
+
+
+def _retriever_classes(ctx: BuildContext) -> tuple[Any, Any]:
+    """依 indexing 方法回傳 (BM25Retriever, EmbeddingRetriever) 類別。"""
+    if ctx.indexing_method == "in_memory":
+        from haystack.components.retrievers.in_memory import (
+            InMemoryBM25Retriever,
+            InMemoryEmbeddingRetriever,
+        )
+
+        return InMemoryBM25Retriever, InMemoryEmbeddingRetriever
+    if ctx.indexing_method == "elasticsearch":
+        try:
+            from haystack_integrations.components.retrievers.elasticsearch import (
+                ElasticsearchBM25Retriever,
+                ElasticsearchEmbeddingRetriever,
+            )
+        except ImportError as exc:
+            raise MissingDependencyError(
+                "elasticsearch-haystack", "elasticsearch 索引的 retrieval"
+            ) from exc
+        return ElasticsearchBM25Retriever, ElasticsearchEmbeddingRetriever
+    raise ConfigError(
+        f"indexing 方法 '{ctx.indexing_method}' 沒有對應的 retriever 實作"
+    )
+
+
+def _query_text_embedder(ctx: BuildContext) -> Any:
+    """從 ingestion.embedding 設定派生查詢端 embedder(同向量空間紀律)。"""
+    if ctx.embedding_config is None:
+        raise ConfigError("缺少 embedding 設定,無法建立查詢端 embedder")
+    method = ctx.embedding_config.methods()[0]
+    factory = _resolve("embedding", EMBEDDING_FACTORIES, method)
+    _, text_embedder = factory.build(ctx.embedding_config.params_for(method), ctx)
+    return text_embedder
+
+
+class _RetrievalParams(BaseParams):
+    top_k: int = Field(default=10, gt=0, description="取回的切片數上限")
+
+
+def _build_bm25_retrieval(raw: dict[str, Any], ctx: BuildContext) -> _RetrievalGraph:
+    p = _validate_params("retrieval", "bm25", _RetrievalParams, raw)
+    bm25_cls, _ = _retriever_classes(ctx)
+    return _RetrievalGraph(
+        components={"retriever": bm25_cls(document_store=ctx.store, top_k=p.top_k)},
+        connections=[],
+        query_targets=[("retriever", "query")],
+        output="retriever",
+    )
+
+
+def _build_embedding_retrieval(
+    raw: dict[str, Any], ctx: BuildContext
+) -> _RetrievalGraph:
+    p = _validate_params("retrieval", "embedding", _RetrievalParams, raw)
+    _, embedding_cls = _retriever_classes(ctx)
+    return _RetrievalGraph(
+        components={
+            "query_embedder": _query_text_embedder(ctx),
+            "retriever": embedding_cls(document_store=ctx.store, top_k=p.top_k),
+        },
+        connections=[("query_embedder.embedding", "retriever.query_embedding")],
+        query_targets=[("query_embedder", "text")],
+        output="retriever",
+    )
+
+
+def _build_hybrid_retrieval(raw: dict[str, Any], ctx: BuildContext) -> _RetrievalGraph:
+    p = _validate_params("retrieval", "hybrid", _RetrievalParams, raw)
+    bm25_cls, embedding_cls = _retriever_classes(ctx)
+    return _RetrievalGraph(
+        components={
+            "query_embedder": _query_text_embedder(ctx),
+            "embedding_retriever": embedding_cls(
+                document_store=ctx.store, top_k=p.top_k
+            ),
+            "bm25_retriever": bm25_cls(document_store=ctx.store, top_k=p.top_k),
+            "joiner": DocumentJoiner(
+                join_mode="reciprocal_rank_fusion", top_k=p.top_k
+            ),
+        },
+        connections=[
+            ("query_embedder.embedding", "embedding_retriever.query_embedding"),
+            ("embedding_retriever.documents", "joiner.documents"),
+            ("bm25_retriever.documents", "joiner.documents"),
+        ],
+        query_targets=[("query_embedder", "text"), ("bm25_retriever", "query")],
+        output="joiner",
+    )
+
+
+RETRIEVAL_FACTORIES: dict[str, SlotFactory] = {
+    "bm25": SlotFactory(
+        build=_build_bm25_retrieval,
+        required_capabilities=frozenset({"text_search"}),
+    ),
+    "embedding": SlotFactory(
+        build=_build_embedding_retrieval,
+        required_capabilities=frozenset({"vector_search"}),
+    ),
+    "hybrid": SlotFactory(
+        build=_build_hybrid_retrieval,
+        required_capabilities=frozenset({"vector_search", "text_search"}),
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
+# Inference pipeline 組裝 / escape hatch / RagPipelines facade
+# ---------------------------------------------------------------------------
+
+
+def build_inference_pipeline(
+    config: RAGConfig, *, store: Any = None
+) -> tuple[Pipeline, dict[str, Any]]:
+    """把 config 的 inference 槽位翻譯成 Haystack Pipeline。
+
+    圖形狀::
+
+        query → [transform 鏈] → MultiQueryRetrievalStage(內部:retriever
+        → ranker 鏈) → SubqueryFusion → ChatPromptBuilder → generator
+
+    Returns:
+        ``(pipeline, meta)``;``meta["query_entry"]`` 是查詢文字的入口
+        socket(RagPipelines.query() 用)。
+
+    Raises:
+        ConfigError / UnknownMethodError / IncompatiblePipelineError
+    """
+    inf = config.inference
+    if inf is None:
+        raise ConfigError(
+            "此配置的 inference 由 haystack_pipelines 提供(原生 pipeline);"
+            "請改用 build_pipelines() 載入"
+        )
+    ing = config.ingestion
+    if ing is None:
+        raise ConfigError(
+            "inference 槽位需要 ingestion 槽位提供索引與 embedding 設定;"
+            "ingestion 使用原生 pipeline 時,inference 也請以 "
+            "haystack_pipelines 提供"
+        )
+    ctx = BuildContext(
+        embedding_config=ing.embedding, generation_config=inf.generation
+    )
+    ctx.indexing_method = _require_single("indexing", ing.indexing)
+    indexing_factory = _resolve("indexing", INDEXING_FACTORIES, ctx.indexing_method)
+    if store is None:
+        store = indexing_factory.build(
+            ing.indexing.params_for(ctx.indexing_method), ctx
+        )
+    ctx.store = store
+
+    # --- 內部單查詢 pipeline:retrieval + reranking 鏈 ---
+    retrieval_method = _require_single("retrieval", inf.retrieval)
+    retrieval_factory = _resolve("retrieval", RETRIEVAL_FACTORIES, retrieval_method)
+    validate_inference_compatibility(
+        retrieval_method,
+        retrieval_factory,
+        ctx.indexing_method,
+        indexing_factory,
+        RETRIEVAL_FACTORIES,
+    )
+    graph = retrieval_factory.build(
+        inf.retrieval.params_for(retrieval_method), ctx
+    )
+
+    inner = Pipeline()
+    for name, comp in graph.components.items():
+        inner.add_component(name, comp)
+    for sender, receiver in graph.connections:
+        inner.connect(sender, receiver)
+    query_targets = list(graph.query_targets)
+    docs_output = graph.output
+
+    ranker_index = 0
+    for method in inf.reranking.methods():
+        factory = _resolve("reranking", RERANKING_FACTORIES, method)
+        ranker = factory.build(inf.reranking.params_for(method), ctx)
+        if ranker is None:
+            continue
+        ranker_index += 1
+        name = "ranker" if ranker_index == 1 else f"ranker_{ranker_index}"
+        inner.add_component(name, ranker)
+        inner.connect(f"{docs_output}.documents", f"{name}.documents")
+        query_targets.append((name, "query"))
+        docs_output = name
+
+    stage = MultiQueryRetrievalStage(
+        inner=inner, query_targets=query_targets, output_component=docs_output
+    )
+
+    # --- 外部 pipeline:transform 鏈 → multi_query → fusion → prompt → LLM ---
+    outer = Pipeline()
+    transform_names: list[str] = []
+    glossary_name: str | None = None
+    for position, method in enumerate(inf.query_transformation.methods()):
+        factory = _resolve("query_transformation", TRANSFORM_FACTORIES, method)
+        transform = factory.build(inf.query_transformation.params_for(method), ctx)
+        if transform is None:  # passthrough
+            continue
+        name = "transform" if not transform_names else f"transform_{position + 1}"
+        outer.add_component(name, transform)
+        if transform_names:
+            outer.connect(f"{transform_names[-1]}.queries", f"{name}.queries")
+        transform_names.append(name)
+        if isinstance(transform, GlossaryExpander):
+            if glossary_name is not None:
+                raise ConfigError(
+                    "query_transformation 鏈中最多只能有一個 'glossary' 方法"
+                    "(prompt 只有一個 glossary_notes 輸入)"
+                )
+            glossary_name = name
+
+    outer.add_component("multi_query", stage)
+    if transform_names:
+        outer.connect(f"{transform_names[-1]}.queries", "multi_query.queries")
+    query_entry = (
+        (transform_names[0], "queries") if transform_names else ("multi_query", "queries")
+    )
+
+    fusion_cfg = inf.fusion or FusionConfig()
+    outer.add_component(
+        "fusion",
+        SubqueryFusion(
+            group_by=fusion_cfg.group_by,
+            strategy=fusion_cfg.strategy,
+            top_k=fusion_cfg.top_k,
+            always_fuse=inf.fusion is not None,
+        ),
+    )
+    outer.connect("multi_query.results", "fusion.results")
+
+    generation_method = _require_single("generation", inf.generation)
+    generation_factory = _resolve("generation", GENERATION_FACTORIES, generation_method)
+    generator, prompt_template, system_prompt = generation_factory.build(
+        inf.generation.params_for(generation_method), ctx
+    )
+    template_messages: list[ChatMessage] = []
+    if system_prompt:
+        template_messages.append(ChatMessage.from_system(system_prompt))
+    template_messages.append(
+        ChatMessage.from_user(prompt_template or DEFAULT_PROMPT_TEMPLATE)
+    )
+    outer.add_component(
+        "prompt_builder",
+        ChatPromptBuilder(
+            template=template_messages, required_variables=["query", "documents"]
+        ),
+    )
+    outer.add_component("generator", generator)
+    outer.connect("fusion.documents", "prompt_builder.documents")
+    if glossary_name is not None:
+        outer.connect(f"{glossary_name}.notes", "prompt_builder.glossary_notes")
+    outer.connect("prompt_builder.prompt", "generator.messages")
+    return outer, {"query_entry": query_entry}
+
+
+def _load_native_pipeline(path: str) -> Pipeline:
+    """載入 escape hatch 指定的原生 Haystack pipeline YAML。"""
+    file = Path(path)
+    if not file.is_file():
+        raise ConfigError(f"找不到 haystack_pipelines 指定的檔案:{file}")
+    try:
+        return Pipeline.loads(file.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ConfigError(
+            f"無法載入原生 Haystack pipeline '{file}':{type(exc).__name__}: {exc}"
+        ) from exc
+
+
+@dataclass
+class RagPipelines:
+    """一組建好的 pipelines(共用同一個 document store)。"""
+
+    config: RAGConfig
+    ingestion: Pipeline
+    inference: Pipeline
+    store: Any
+    query_entry: tuple[str, str] | None = None
+
+    def run_ingestion(self) -> dict[str, Any]:
+        """執行 ingestion(來源資訊已在 config 中)。"""
+        return self.ingestion.run({})
+
+    def query(self, text: str) -> dict[str, Any]:
+        """執行單次查詢,回傳答案與可稽核的中間結果。
+
+        Returns:
+            dict:``answer``(回答文字)、``documents``(融合後切片)、
+            ``subquery_results``(各子查詢重排後結果)、``prompt``
+            (實際送出的 prompt,可稽核)、``reply_meta``(模型 /
+            finish_reason / usage 等)。
+
+        Raises:
+            ConfigError: inference 由原生 Haystack YAML 載入
+                (query() 便利介面只支援槽位式配置,請直接呼叫
+                ``.inference.run(...)``)。
+        """
+        if self.query_entry is None:
+            raise ConfigError(
+                "inference pipeline 由原生 Haystack YAML 載入,"
+                "query() 便利介面不適用;請直接呼叫 .inference.run(...)"
+            )
+        entry_component, entry_socket = self.query_entry
+        data: dict[str, Any] = {
+            entry_component: {entry_socket: [text]},
+            "prompt_builder": {"query": text},
+        }
+        result = self.inference.run(
+            data, include_outputs_from={"fusion", "multi_query", "prompt_builder"}
+        )
+        reply = result["generator"]["replies"][0]
+        prompt_messages = result.get("prompt_builder", {}).get("prompt", [])
+        prompt_text = "\n\n".join(
+            message.text or "" for message in prompt_messages
+        )
+        return {
+            "answer": reply.text,
+            "documents": result["fusion"]["documents"],
+            "subquery_results": result["multi_query"]["results"],
+            "prompt": prompt_text,
+            "reply_meta": dict(reply.meta or {}),
+        }
+
+
+def build_pipelines(config: RAGConfig, *, store: Any = None) -> RagPipelines:
+    """把整份配置翻譯成可執行的 pipelines(含 escape hatch 處理)。
+
+    槽位式的階段經 builder 組裝;``haystack_pipelines`` 指定的階段直接
+    載入原生 pipeline YAML(跳過相容性檢查,專家模式)。
+
+    注意:escape hatch 的 ingestion + 槽位式 inference 只在索引為外部
+    服務(如 elasticsearch)時有意義 —— in_memory store 無法跨 pipeline
+    共享原生 pipeline 寫入的內容。
+    """
+    native = config.haystack_pipelines
+    if native is not None and native.ingestion is not None:
+        ingestion_pipeline = _load_native_pipeline(native.ingestion)
+    else:
+        ingestion_pipeline, store = build_ingestion_pipeline(config, store=store)
+
+    query_entry: tuple[str, str] | None = None
+    if native is not None and native.inference is not None:
+        inference_pipeline = _load_native_pipeline(native.inference)
+    else:
+        inference_pipeline, meta = build_inference_pipeline(config, store=store)
+        query_entry = meta["query_entry"]
+    return RagPipelines(
+        config=config,
+        ingestion=ingestion_pipeline,
+        inference=inference_pipeline,
+        store=store,
+        query_entry=query_entry,
+    )

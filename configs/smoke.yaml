@@ -1,0 +1,62 @@
+# 全離線煙霧測試配置:不需網路、不需金鑰、不下載模型。
+# 一次跑過所有「新」機制:parsing 方法鏈、mock embedding、hybrid 檢索、
+# LLM 查詢拆解(mock 腳本)、LLM 重排(mock 腳本)、fusion 按文件聚合。
+#
+#   python scripts/run_demo.py --config configs/smoke.yaml
+
+ingestion:
+  import:
+    method: local_file
+    params:
+      input_dir: ./data/raw
+  parsing:
+    method: [plain_text, clean]     # 方法鏈:轉 Document 後再清理
+  chunking:
+    method: fixed_size
+    params:
+      split_length: 120
+      split_overlap: 20
+  embedding:
+    method: mock                    # 確定性偽向量,離線可跑
+    params:
+      dim: 32
+  indexing:
+    method: in_memory
+
+inference:
+  query_transformation:
+    method: [normalize, llm_decompose]
+    method_params:
+      normalize:
+        lowercase: true
+      llm_decompose:
+        max_subqueries: 3
+        generator:                  # 拆解用 mock LLM(腳本化輸出兩個子查詢)
+          method: mock
+          params:
+            replies:
+              - "1. FAISS 支援哪些索引結構?\n2. Elasticsearch 提供哪些檢索能力?"
+  retrieval:
+    method: hybrid                  # BM25 + 向量,RRF 融合
+    params:
+      top_k: 4
+  reranking:
+    method: llm                     # LLMRanker + mock LLM(腳本化回傳排序)
+    params:
+      top_k: 4
+      generator:
+        method: mock
+        params:
+          replies:
+            - '{"documents": [{"index": 1}, {"index": 2}]}'
+  generation:
+    method: mock
+  fusion:
+    group_by: doc                   # 子查詢結果按文件聚合
+    strategy: rrf
+    top_k: 3
+
+evaluation:
+  method: basic_retrieval_metrics
+  params:
+    dataset_path: ./data/eval/qa.jsonl

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from conftest import make_config
 
-from rag.builder import build_ingestion_pipeline
+from rag.builder import build_ingestion_pipeline, build_pipelines
 from rag.config import parse_config
 from rag.errors import ConfigError, UnknownMethodError
 
@@ -108,3 +108,53 @@ def test_native_pipeline_stage_requires_build_pipelines():
     config = parse_config(data)
     with pytest.raises(ConfigError, match="build_pipelines"):
         build_ingestion_pipeline(config)
+
+
+class TestEscapeHatch:
+    def _native_inference_config(self, tmp_path, corpus_dir):
+        from haystack import Pipeline
+        from haystack.components.builders import PromptBuilder
+
+        native = Pipeline()
+        native.add_component("prompt_builder", PromptBuilder(template="Q: {{ q }}"))
+        path = tmp_path / "native_inference.yaml"
+        path.write_text(native.dumps(), encoding="utf-8")
+
+        data = make_config(
+            ingestion={
+                "import": {
+                    "method": "local_file",
+                    "params": {"input_dir": str(corpus_dir)},
+                }
+            }
+        )
+        del data["inference"]
+        data["haystack_pipelines"] = {"inference": str(path)}
+        return parse_config(data)
+
+    def test_native_inference_loads_and_disables_query_helper(
+        self, tmp_path, corpus_dir
+    ):
+        config = self._native_inference_config(tmp_path, corpus_dir)
+        pipelines = build_pipelines(config)
+        assert pipelines.query_entry is None
+        # 原生 pipeline 本身可直接執行
+        out = pipelines.inference.run({"prompt_builder": {"q": "hi"}})
+        assert out["prompt_builder"]["prompt"] == "Q: hi"
+        # query() 便利介面明確拒絕並指路
+        with pytest.raises(ConfigError, match="原生 Haystack YAML"):
+            pipelines.query("hi")
+
+    def test_native_pipeline_missing_file(self, corpus_dir):
+        data = make_config(
+            ingestion={
+                "import": {
+                    "method": "local_file",
+                    "params": {"input_dir": str(corpus_dir)},
+                }
+            }
+        )
+        del data["inference"]
+        data["haystack_pipelines"] = {"inference": "does/not/exist.yaml"}
+        with pytest.raises(ConfigError, match="找不到 haystack_pipelines 指定的檔案"):
+            build_pipelines(parse_config(data))
