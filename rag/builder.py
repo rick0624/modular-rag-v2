@@ -328,7 +328,15 @@ class _InMemoryParams(BaseParams):
 
 def _build_in_memory_store(raw: dict[str, Any], ctx: BuildContext) -> Any:
     _validate_params("indexing", "in_memory", _InMemoryParams, raw)
-    return InMemoryDocumentStore(embedding_similarity_function="cosine")
+    # BM25 斷詞:預設的 \w+ 會把整段中文吞成一個 token,中文查詢幾乎
+    # 比不到;改為「CJK 逐字 + 拉丁/數字詞」(ES 的 standard analyzer
+    # 對 CJK 也是逐字,行為一致)。
+    return InMemoryDocumentStore(
+        embedding_similarity_function="cosine",
+        bm25_tokenization_regex=(
+            r"[㐀-䶿一-鿿豈-﫿]|[A-Za-z0-9_]+"
+        ),
+    )
 
 
 class _ElasticsearchParams(BaseParams):

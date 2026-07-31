@@ -1,0 +1,126 @@
+# 預設配置,同時是「方法型錄」:每個槽位可用的方法與參數都以
+# method_params 區塊並存展示 —— 換方法只需改 method 那一行,其餘區塊
+# 原樣保留、互不干擾(只有被選中的區塊會做參數驗證)。
+#
+# 目前啟用的組合完全離線:mock embedding + in_memory 索引 + mock 生成,
+# 不需網路、金鑰或模型下載,適合開發與試跑:
+#
+#   python scripts/run_demo.py
+#
+# 注意:未啟用的示範區塊使用「字面值占位符」(如 YOUR_TOKEN),不用
+# ${ENV_VAR} —— 因為 ${} 會在載入時立刻展開,引用未設定的變數即使在
+# 未使用的區塊也會報錯。實際接入時改成 ${YOUR_ENV_VAR} 並於 .env 提供。
+
+ingestion:
+  import:
+    method: local_file              # 可選:local_file / pdf_file
+    method_params:
+      local_file:
+        input_dir: ./data/raw
+        # extensions: [".txt", ".md"]
+      pdf_file:
+        input_dir: ./data/pdfs
+
+  parsing:
+    method: plain_text              # 可選:plain_text / pdf;鏈:[pdf, clean]
+    method_params:
+      plain_text:
+        encoding: utf-8
+      pdf: {}
+      clean:                        # 只能接在 converter 之後(方法鏈)
+        remove_empty_lines: true
+        remove_extra_whitespaces: true
+
+  chunking:
+    method: fixed_size              # 可選:fixed_size / structure_based / page_based / no_chunking
+    method_params:
+      fixed_size:                   # 固定長度(字元),\f/段落/行邊界優先
+        split_length: 300
+        split_overlap: 50
+      structure_based:              # 依結構遞迴切分(頁 → 段 → 行 → 句)
+        split_length: 512
+      page_based:                   # 按頁切(需要會產生分頁的 parser,如 pdf)
+        pages_per_chunk: 1
+      no_chunking: {}
+
+  embedding:
+    method: mock                    # 可選:mock / sentence_transformers / api_embedding
+    method_params:
+      mock:                         # 離線確定性偽向量(開發測試用)
+        dim: 64
+      sentence_transformers:        # 需安裝:pip install -e ".[st]"
+        model_name: sentence-transformers/all-MiniLM-L6-v2
+      api_embedding:                # 通用 HTTP API(回應形狀見 README 對映表)
+        endpoint: https://api.example.com/v1/embeddings
+        headers:
+          Authorization: Bearer YOUR_TOKEN
+        model: your-embedding-model
+        embeddings_field: data      # OpenAI 式回應:data[].embedding
+        item_field: embedding
+
+  indexing:
+    method: in_memory               # 可選:in_memory / elasticsearch
+    method_params:
+      in_memory: {}
+      elasticsearch:                # 需安裝:pip install -e ".[es]"
+        hosts: http://localhost:9200
+        index: modular-rag
+
+inference:
+  query_transformation:
+    method: normalize               # 可選:passthrough / normalize / glossary / llm_decompose
+    method_params:                  # 鏈:[normalize, llm_decompose]
+      normalize:
+        lowercase: true
+      glossary:                     # 術語表:命中的定義注入 prompt
+        glossary:
+          RRF: Reciprocal Rank Fusion,以名次融合多路檢索結果
+        # glossary_path: ./configs/glossary.yaml
+        # expand_query: false
+      llm_decompose:                # LLM 查詢拆解(1 → N 子查詢)
+        max_subqueries: 3
+        # generator 未設定時沿用 generation 槽位的 LLM
+
+  retrieval:
+    method: bm25                    # 可選:bm25 / embedding / hybrid
+    method_params:
+      bm25:
+        top_k: 5
+      embedding:
+        top_k: 5
+      hybrid:                       # BM25 + 向量,RRF 融合
+        top_k: 5
+
+  reranking:
+    method: none                    # 可選:none / similarity / llm;鏈:[similarity, llm]
+    method_params:
+      none: {}
+      similarity:                   # cross-encoder(需 ".[st]")
+        model: cross-encoder/ms-marco-MiniLM-L-6-v2
+        top_k: 10
+      llm:                          # LLM listwise 重排
+        top_k: 5
+        # generator 未設定時沿用 generation 槽位的 LLM
+
+  generation:
+    method: mock                    # 可選:mock / openai / gateway_openai_compatible
+    method_params:
+      mock: {}
+      openai:                       # 官方 OpenAI(或相容 base_url)
+        model: gpt-5-mini
+        # api_key 未設定時使用 OPENAI_API_KEY 環境變數
+        # api_base_url: http://localhost:11434/v1   # Ollama 等
+      gateway_openai_compatible:    # 公司內部閘道(可不帶 model 欄位)
+        base_url: https://llm.example.com/v1
+        api_key: YOUR_TOKEN
+        system_prompt: 只根據提供的內容回答問題。
+
+  # fusion:                         # 選填:多子查詢融合 / doc、page 聚合
+  #   group_by: doc                 # none / doc / page
+  #   strategy: rrf                 # rrf / concat_dedup / max_score
+  #   top_k: 5
+
+evaluation:                         # 選填;省略則 demo 跳過評估
+  method: basic_retrieval_metrics
+  params:
+    dataset_path: ./data/eval/qa.jsonl

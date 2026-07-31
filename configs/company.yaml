@@ -1,0 +1,92 @@
+# 公司環境配置:Elasticsearch + 公司 embedding API + 公司 LLM 閘道。
+#
+# 機密一律以 ${ENV_VAR} 注入:複製 .env.example 為 .env 填入金鑰即可,
+# 設定檔可以安心進版控。
+#
+#   cp .env.example .env
+#   docker compose up -d          # 或指向既有的 ES 叢集
+#   python scripts/run_demo.py --config configs/company.yaml
+#
+# 需要的環境變數:ES_URL、COMPANY_EMBEDDING_API_KEY、COMPANY_LLM_API_KEY
+
+ingestion:
+  import:
+    method: local_file
+    params:
+      input_dir: ./data/raw
+
+  parsing:
+    method: plain_text              # PDF 來源改:import 換 pdf_file、這裡換 pdf
+
+  chunking:
+    method: fixed_size
+    params:
+      split_length: 300
+      split_overlap: 50
+
+  embedding:
+    method: api_embedding           # 公司 embedding API(OpenAI 式回應)
+    method_params:
+      api_embedding:
+        endpoint: https://your-company-api.example.com/v1/embeddings
+        headers:
+          Authorization: Bearer ${COMPANY_EMBEDDING_API_KEY}
+        model: your-embedding-model # 閘道不接受 model 欄位時,刪掉此行即可
+        batch_size: 16
+        embeddings_field: data      # {"data": [{"embedding": [...]}]} 形狀
+        item_field: embedding
+      sentence_transformers:        # 本地模型備援(切 method 即換)
+        model_name: sentence-transformers/all-MiniLM-L6-v2
+
+  indexing:
+    method: elasticsearch           # 向量 + BM25 + filter 都在 ES 伺服器端
+    params:
+      hosts: ${ES_URL}
+      index: modular-rag-company
+
+inference:
+  query_transformation:
+    method: [normalize, llm_decompose]   # 先正規化,再 LLM 拆解子查詢
+    method_params:
+      normalize:
+        lowercase: true
+      llm_decompose:
+        max_subqueries: 3
+        # 未指定 generator:沿用下方 generation 槽位的公司閘道
+
+  retrieval:
+    method: hybrid                  # ES BM25 + kNN,RRF 融合
+    params:
+      top_k: 10
+
+  reranking:
+    method: [similarity, llm]       # 雙段:cross-encoder 收斂 → LLM 精排
+    method_params:
+      similarity:                   # 需安裝:pip install -e ".[st]"
+        model: cross-encoder/ms-marco-MiniLM-L-6-v2
+        top_k: 10
+      llm:
+        top_k: 5
+        # 未指定 generator:沿用 generation 槽位的公司閘道
+
+  generation:
+    method: gateway_openai_compatible
+    method_params:
+      gateway_openai_compatible:
+        base_url: https://your-company-llm.example.com/v1
+        api_key: ${COMPANY_LLM_API_KEY}
+        # model 刻意不設定:公司閘道不接受 model 欄位,請求將不帶該欄位
+        system_prompt: 只根據提供的內容回答問題;內容不足時明確說明無法回答。
+        temperature: 0.2
+        # max_tokens: 1024
+      mock: {}                      # 離線試跑備援(切 method 即換)
+
+  fusion:
+    group_by: doc                   # 子查詢結果按文件聚合
+    strategy: rrf
+    top_k: 5
+
+evaluation:
+  method: basic_retrieval_metrics
+  params:
+    dataset_path: ./data/eval/qa.jsonl
