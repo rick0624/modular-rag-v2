@@ -48,10 +48,13 @@ def main() -> None:
         head = " ".join((doc.content or "").split())[:60]
         print(f"{rank}. score={doc.score:.4f} [{doc.meta.get('chunk_id')}]{extras}")
         print(f"   {head}")
-    print("\n--- 送出的 prompt(前 400 字)---")
-    print(result["prompt"][:400])
-    print("\n--- 回答 ---")
-    print(result["answer"])
+    if result["answer"] is None:
+        print("\n(generate_answer: false — 僅檢索,略過生成)")
+    else:
+        print("\n--- 送出的 prompt(前 400 字)---")
+        print(result["prompt"][:400])
+        print("\n--- 回答 ---")
+        print(result["answer"])
 
     if config.evaluation is not None:
         print("\n=== 評估 ===")

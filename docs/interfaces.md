@@ -53,6 +53,7 @@ Inference:  query:str → query_transformation 鏈(list[str] → list[str])
             → MultiQueryRetrievalStage(內部:retrieval [→ reranking 鏈])
             → list[list[Document]] → SubqueryFusion → list[Document]
             → ChatPromptBuilder → chat generator → replies
+            (generate_answer: false 時圖止於 SubqueryFusion,檢索-only)
 
 Evaluation: JSONL 測試集 → 逐題 RagPipelines.query() → hit_rate / MRR
 ```
@@ -64,10 +65,10 @@ Evaluation: JSONL 測試集 → 逐題 RagPipelines.query() → hit_rate / MRR
 | chunking | documents → documents(splitter;`no_chunking` = 無節點) | ✗ |
 | embedding | factory 一次建 (document_embedder, text_embedder) 一對 | ✗ |
 | indexing | factory 回傳 document store(+ 能力宣告) | ✗ |
-| query_transformation | `queries: list[str]` → `list[str]`(glossary 另輸出 `notes`) | ✓ |
-| retrieval | 展開為內部圖(retriever[s] + joiner),輸出 documents | ✗ |
-| reranking | documents(+query)→ documents;**只能重排/過濾/改分,不得改內容** | ✓ |
-| generation | ChatPromptBuilder 的 messages → `replies: [ChatMessage]` | ✗ |
+| query_transformation | `queries: list[str]` → `list[str]`(glossary 另輸出 `notes`;jargon_mapping **替換**查詢文字,glossary 只附註) | ✓ |
+| retrieval | 展開為內部圖(retriever[s] + joiner),輸出 documents;`boost_k_factor` 放大候選為 top_k × factor | ✗ |
+| reranking | documents(+query)→ documents;**只能重排/過濾/改分,不得改內容**(llm_fact_check 純過濾:順序與分數皆保留) | ✓ |
+| generation | ChatPromptBuilder 的 messages → `replies: [ChatMessage]`;`generate_answer: false` 時整段省略(此時 generation 區塊選填,僅作 LLM 沿用來源) | ✗ |
 | fusion(內建步驟) | `list[list[Document]]` → `list[Document]`(非槽位,`inference.fusion` 設定) | — |
 
 ## 4. 相容性宣告(建構期檢查)

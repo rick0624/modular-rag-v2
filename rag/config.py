@@ -175,11 +175,28 @@ class InferenceConfig(BaseModel):
     query_transformation: MethodConfig = Field(description="槽位:Query Transformation(可方法鏈)")
     retrieval: MethodConfig = Field(description="槽位:Retrieval")
     reranking: MethodConfig = Field(description="槽位:Reranking(可方法鏈)")
-    generation: MethodConfig = Field(description="槽位:Generation")
+    generation: MethodConfig | None = Field(
+        default=None,
+        description="槽位:Generation(generate_answer: false 時可省略;"
+        "保留時作為各 LLM 方法沿用的預設連線)",
+    )
+    generate_answer: bool = Field(
+        default=True,
+        description="是否執行答案生成;false 時 pipeline 止於 fusion(檢索-only)",
+    )
     fusion: FusionConfig | None = Field(
         default=None,
         description="融合 / 聚合步驟(選填;多子查詢或 doc/page 聚合時使用)",
     )
+
+    @model_validator(mode="after")
+    def _generation_required_unless_skipped(self) -> "InferenceConfig":
+        if self.generate_answer and self.generation is None:
+            raise ValueError(
+                "generate_answer 為 true(預設)時必須提供 generation 槽位;"
+                "檢索-only 模式請設定 generate_answer: false"
+            )
+        return self
 
 
 class HaystackPipelinesConfig(BaseModel):

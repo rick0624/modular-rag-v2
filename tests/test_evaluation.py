@@ -181,6 +181,24 @@ class TestConfigFilesParse:
         assert gateway["api_key"] == "k2"
         assert "model" not in gateway
 
+    def test_condense_yaml_parses_with_env(self, monkeypatch):
+        monkeypatch.setenv("ES_URL", "http://localhost:9200")
+        monkeypatch.setenv("COMPANY_EMBEDDING_API_KEY", "k1")
+        monkeypatch.setenv("COMPANY_LLM_API_KEY", "k2")
+        config = load_config(CONFIGS_DIR / "condense.yaml", dotenv_path=None)
+        assert config.inference.generate_answer is False
+        assert config.inference.query_transformation.methods() == [
+            "jargon_mapping",
+            "llm_rewrite",
+        ]
+        retrieval = config.inference.retrieval.params_for("hybrid")
+        assert retrieval["boost_k_factor"] == 3
+        assert config.inference.reranking.methods() == [
+            "similarity",
+            "llm_fact_check",
+        ]
+        assert config.inference.fusion.top_k == 3
+
     def test_company_yaml_fails_loud_without_env(self, monkeypatch):
         monkeypatch.delenv("ES_URL", raising=False)
         monkeypatch.delenv("COMPANY_EMBEDDING_API_KEY", raising=False)

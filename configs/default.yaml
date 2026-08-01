@@ -68,15 +68,22 @@ ingestion:
 
 inference:
   query_transformation:
-    method: normalize               # 可選:passthrough / normalize / glossary / llm_decompose
-    method_params:                  # 鏈:[normalize, llm_decompose]
+    method: normalize               # 可選:passthrough / normalize / glossary / jargon_mapping / llm_rewrite / llm_decompose
+    method_params:                  # 鏈:[normalize, llm_decompose] 或 [jargon_mapping, llm_rewrite]
       normalize:
         lowercase: true
-      glossary:                     # 術語表:命中的定義注入 prompt
+      glossary:                     # 術語表:命中的定義注入 prompt(不改查詢)
         glossary:
           RRF: Reciprocal Rank Fusion,以名次融合多路檢索結果
         # glossary_path: ./configs/glossary.yaml
         # expand_query: false
+      jargon_mapping:               # 術語直白化:直接替換查詢中的術語
+        mapping:
+          RRF: 多路檢索名次融合
+        # json_path: ./configs/jargon.json
+      llm_rewrite: {}               # LLM 查詢改寫(1 → 1,更適合檢索的形式)
+        # generator 未設定時沿用 generation 槽位的 LLM
+        # prompt: 可覆寫預設改寫 prompt(含 {{ query }})
       llm_decompose:                # LLM 查詢拆解(1 → N 子查詢)
         max_subqueries: 3
         # generator 未設定時沿用 generation 槽位的 LLM
@@ -90,9 +97,10 @@ inference:
         top_k: 5
       hybrid:                       # BM25 + 向量,RRF 融合
         top_k: 5
+        # boost_k_factor: 3         # 候選放大:各 retriever 取 top_k × 3 供 rerank 收斂
 
   reranking:
-    method: none                    # 可選:none / similarity / llm;鏈:[similarity, llm]
+    method: none                    # 可選:none / similarity / llm / llm_fact_check;鏈:[similarity, llm_fact_check]
     method_params:
       none: {}
       similarity:                   # cross-encoder(需 ".[st]")
@@ -101,6 +109,9 @@ inference:
       llm:                          # LLM listwise 重排
         top_k: 5
         # generator 未設定時沿用 generation 槽位的 LLM
+      llm_fact_check: {}            # LLM 事實查核:移除與查詢不相關的切片(只過濾)
+        # generator 未設定時沿用 generation 槽位的 LLM
+        # max_docs: 10              # 送查核的切片數上限,其餘原樣通過
 
   generation:
     method: mock                    # 可選:mock / openai / gateway_openai_compatible
@@ -115,8 +126,11 @@ inference:
         api_key: YOUR_TOKEN
         system_prompt: 只根據提供的內容回答問題。
 
-  # fusion:                         # 選填:多子查詢融合 / doc、page 聚合
-  #   group_by: doc                 # none / doc / page
+  # generate_answer: false          # 檢索-only:不做生成,query() 回傳檢索文件
+  #                                 # (generation 區塊仍可保留,作為 LLM 方法沿用來源)
+
+  # fusion:                         # 選填:多子查詢融合 / doc、page 聚合;
+  #   group_by: doc                 # none / doc / page   設定後單查詢也會去重排序
   #   strategy: rrf                 # rrf / concat_dedup / max_score
   #   top_k: 5
 

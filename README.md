@@ -26,10 +26,10 @@ Evaluation: JSONL 測試集 → 逐題查詢 → hit rate / MRR
 | chunking | **fixed_size** / structure_based / page_based / no_chunking | (Recursive)DocumentSplitter,一律字元單位 |
 | embedding | **mock** / sentence_transformers / api_embedding | ST 整合套件 / 自訂 Flexible API embedder |
 | indexing | **in_memory** / elasticsearch | InMemory / Elasticsearch DocumentStore |
-| query_transformation | **normalize** / passthrough / glossary / llm_decompose | 自訂元件(`list[str] → list[str]`) |
-| retrieval | **bm25** / embedding / hybrid | 依 indexing 選 retriever;hybrid 走 RRF |
-| reranking | **none** / similarity / llm | ST cross-encoder / core LLMRanker |
-| generation | **mock** / openai / gateway_openai_compatible | OpenAIChatGenerator / 自訂閘道 generator |
+| query_transformation | **normalize** / passthrough / glossary / jargon_mapping / llm_rewrite / llm_decompose | 自訂元件(`list[str] → list[str]`) |
+| retrieval | **bm25** / embedding / hybrid(皆支援 `boost_k_factor` 候選放大) | 依 indexing 選 retriever;hybrid 走 RRF |
+| reranking | **none** / similarity / llm / llm_fact_check | ST cross-encoder / core LLMRanker / 自訂 LLMFactChecker |
+| generation | **mock** / openai / gateway_openai_compatible(`generate_answer: false` 可跳過) | OpenAIChatGenerator / 自訂閘道 generator |
 | fusion(內建步驟) | rrf / concat_dedup / max_score × group_by none/doc/page | 自訂 SubqueryFusion(v1 演算法) |
 | evaluation | basic_retrieval_metrics | hit rate / MRR(doc_id 依名次去重) |
 
@@ -66,6 +66,7 @@ prompt(可稽核)、回答與 hit rate / MRR。
 | `default.yaml` | mock embedding + in_memory + mock LLM;**同時是方法型錄** | 離線開發、試跑 |
 | `smoke.yaml` | 方法鏈 + LLM 拆解(mock 腳本)+ hybrid + LLM 重排(mock 腳本)+ fusion | 煙霧測試 |
 | `company.yaml` | ES + 公司 embedding API + 公司 LLM 閘道 + 雙段 rerank + fusion | 公司環境 |
+| `condense.yaml` | query condense(術語替換 + LLM 改寫)+ hybrid 候選放大 + rerank + LLM 事實查核 + top 3,**不做生成** | 檢索-only 服務 |
 
 公司環境:
 
@@ -223,9 +224,26 @@ TRANSFORM_FACTORIES["by_sentence"] = SlotFactory(build=_build_by_sentence)
   `model` 未設定時請求**完全不帶**該欄位(官方 SDK 做不到);
   OpenAI 推理模型(gpt-5 / o 系列)自動忽略 `temperature`、
   改以 `max_completion_tokens` 送出,不需調整 YAML。
-- `llm_decompose` 與 `llm` 重排未指定 `generator` 時,**沿用
-  generation 槽位的 LLM 設定**(各自新實例);也可各自指定
-  (smoke.yaml 用 mock 腳本示範)。
+- `llm_decompose`、`llm_rewrite`、`llm` 重排與 `llm_fact_check` 未指定
+  `generator` 時,**沿用 generation 槽位的 LLM 設定**(各自新實例);
+  也可各自指定(smoke.yaml 用 mock 腳本示範)。
+
+## 檢索-only 模式(`generate_answer: false`)
+
+系統只需要檢索結果、不需要 LLM 生成答案時,在 `inference` 設定
+`generate_answer: false`:
+
+- pipeline 止於 fusion(去重、排序、裁 `top_k`),不建 prompt_builder
+  與 generator;`query()` 回傳的 key 不變,但 `answer` / `prompt` /
+  `reply_meta` 為 `None`,檢索結果照常在 `documents`。
+- `generation` 區塊此時**可省略**;保留時只作為 `llm_rewrite` /
+  `llm` / `llm_fact_check` 等 LLM 方法的沿用連線來源(見上)。
+  兩者都沒有時,這些方法必須各自指定 `params.generator`。
+- 完整範例見 `configs/condense.yaml`:術語替換(`jargon_mapping`,
+  JSON 對照表)→ LLM 改寫(`llm_rewrite`)→ hybrid 檢索候選放大
+  (`boost_k_factor: 3`,各 retriever 取 top_k × 3)→ cross-encoder
+  收斂 → LLM 事實查核(`llm_fact_check`,只移除不相關切片,不重排
+  不改分)→ fusion 去重排序回傳 top 3。
 
 ## v1 → v2 遷移註記
 

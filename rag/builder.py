@@ -47,10 +47,14 @@ from rag.components.gateway_generator import GatewayChatGenerator, MockChatGener
 from rag.components.meta_stamper import ChunkMetaStamper
 from rag.components.mock_embedders import MockDocumentEmbedder, MockTextEmbedder
 from rag.components.multi_query import MultiQueryRetrievalStage
+from rag.components.fact_check import DEFAULT_FACT_CHECK_PROMPT, LLMFactChecker
 from rag.components.query_transforms import (
     DEFAULT_DECOMPOSE_PROMPT,
+    DEFAULT_REWRITE_PROMPT,
     GlossaryExpander,
+    JargonMapper,
     LLMQueryDecomposer,
+    LLMQueryRewriter,
     QueryNormalizer,
 )
 from rag.config import FusionConfig, MethodConfig, RAGConfig
@@ -662,6 +666,7 @@ def _chat_generator_from_block(
             raise ConfigError(
                 f"{where} 需要 chat generator:請在 params.generator 指定,"
                 "或提供 generation 槽位設定供沿用"
+                "(generate_answer: false 時 generation 區塊仍可保留,僅作為沿用來源)"
             )
         method = ctx.generation_config.methods()[0]
         factory = _resolve("generation", GENERATION_FACTORIES, method)
@@ -730,6 +735,39 @@ def _build_llm_decompose(raw: dict[str, Any], ctx: BuildContext) -> Any:
     )
 
 
+class _JargonMappingParams(BaseParams):
+    mapping: dict[str, str] | None = Field(
+        default=None, description="行內術語對照表(術語: 直白描述)"
+    )
+    json_path: str | None = Field(
+        default=None, description="對照表 JSON 檔路徑(扁平物件:術語: 直白描述)"
+    )
+
+
+def _build_jargon_mapping(raw: dict[str, Any], ctx: BuildContext) -> Any:
+    p = _validate_params("query_transformation", "jargon_mapping", _JargonMappingParams, raw)
+    return JargonMapper(mapping=p.mapping, json_path=p.json_path)
+
+
+class _RewriteParams(BaseParams):
+    prompt: str = Field(
+        default=DEFAULT_REWRITE_PROMPT, description="改寫 prompt(含 {{ query }})"
+    )
+    generator: dict[str, Any] | None = Field(
+        default=None,
+        description="改寫用的 chat generator({method, params});"
+        "未設定時沿用 generation 槽位",
+    )
+
+
+def _build_llm_rewrite(raw: dict[str, Any], ctx: BuildContext) -> Any:
+    p = _validate_params("query_transformation", "llm_rewrite", _RewriteParams, raw)
+    chat_generator = _chat_generator_from_block(
+        "query_transformation 方法 'llm_rewrite'", p.generator, ctx
+    )
+    return LLMQueryRewriter(chat_generator=chat_generator, prompt=p.prompt)
+
+
 class _PassthroughParams(BaseParams):
     pass
 
@@ -743,6 +781,8 @@ TRANSFORM_FACTORIES: dict[str, SlotFactory] = {
     "passthrough": SlotFactory(build=_build_passthrough),
     "normalize": SlotFactory(build=_build_normalize),
     "glossary": SlotFactory(build=_build_glossary),
+    "jargon_mapping": SlotFactory(build=_build_jargon_mapping),
+    "llm_rewrite": SlotFactory(build=_build_llm_rewrite),
     "llm_decompose": SlotFactory(build=_build_llm_decompose),
 }
 
@@ -789,6 +829,31 @@ def _build_llm_ranker(raw: dict[str, Any], ctx: BuildContext) -> Any:
     return LLMRanker(chat_generator=chat_generator, top_k=p.top_k)
 
 
+class _LLMFactCheckParams(BaseParams):
+    prompt: str = Field(
+        default=DEFAULT_FACT_CHECK_PROMPT,
+        description="查核 prompt(含 {{ query }} 與 {{ documents }})",
+    )
+    max_docs: int | None = Field(
+        default=None, gt=0, description="送交 LLM 查核的切片數上限;其餘原樣通過"
+    )
+    generator: dict[str, Any] | None = Field(
+        default=None,
+        description="查核用的 chat generator({method, params});"
+        "未設定時沿用 generation 槽位",
+    )
+
+
+def _build_llm_fact_check(raw: dict[str, Any], ctx: BuildContext) -> Any:
+    p = _validate_params("reranking", "llm_fact_check", _LLMFactCheckParams, raw)
+    chat_generator = _chat_generator_from_block(
+        "reranking 方法 'llm_fact_check'", p.generator, ctx
+    )
+    return LLMFactChecker(
+        chat_generator=chat_generator, prompt=p.prompt, max_docs=p.max_docs
+    )
+
+
 class _NoRerankParams(BaseParams):
     pass
 
@@ -802,6 +867,7 @@ RERANKING_FACTORIES: dict[str, SlotFactory] = {
     "none": SlotFactory(build=_build_no_rerank),
     "similarity": SlotFactory(build=_build_similarity_ranker),
     "llm": SlotFactory(build=_build_llm_ranker),
+    "llm_fact_check": SlotFactory(build=_build_llm_fact_check),
 }
 
 
@@ -852,13 +918,23 @@ def _query_text_embedder(ctx: BuildContext) -> Any:
 
 class _RetrievalParams(BaseParams):
     top_k: int = Field(default=10, gt=0, description="取回的切片數上限")
+    boost_k_factor: int = Field(
+        default=1,
+        ge=1,
+        description="候選放大倍率:各 retriever 取回 top_k × boost_k_factor 筆,"
+        "供下游 rerank 收斂到 top n",
+    )
+
+    @property
+    def fetch_k(self) -> int:
+        return self.top_k * self.boost_k_factor
 
 
 def _build_bm25_retrieval(raw: dict[str, Any], ctx: BuildContext) -> _RetrievalGraph:
     p = _validate_params("retrieval", "bm25", _RetrievalParams, raw)
     bm25_cls, _ = _retriever_classes(ctx)
     return _RetrievalGraph(
-        components={"retriever": bm25_cls(document_store=ctx.store, top_k=p.top_k)},
+        components={"retriever": bm25_cls(document_store=ctx.store, top_k=p.fetch_k)},
         connections=[],
         query_targets=[("retriever", "query")],
         output="retriever",
@@ -873,7 +949,7 @@ def _build_embedding_retrieval(
     return _RetrievalGraph(
         components={
             "query_embedder": _query_text_embedder(ctx),
-            "retriever": embedding_cls(document_store=ctx.store, top_k=p.top_k),
+            "retriever": embedding_cls(document_store=ctx.store, top_k=p.fetch_k),
         },
         connections=[("query_embedder.embedding", "retriever.query_embedding")],
         query_targets=[("query_embedder", "text")],
@@ -884,15 +960,16 @@ def _build_embedding_retrieval(
 def _build_hybrid_retrieval(raw: dict[str, Any], ctx: BuildContext) -> _RetrievalGraph:
     p = _validate_params("retrieval", "hybrid", _RetrievalParams, raw)
     bm25_cls, embedding_cls = _retriever_classes(ctx)
+    # joiner 也用 fetch_k:joiner 是餵給 reranker 的輸出,不能提前裁切候選池。
     return _RetrievalGraph(
         components={
             "query_embedder": _query_text_embedder(ctx),
             "embedding_retriever": embedding_cls(
-                document_store=ctx.store, top_k=p.top_k
+                document_store=ctx.store, top_k=p.fetch_k
             ),
-            "bm25_retriever": bm25_cls(document_store=ctx.store, top_k=p.top_k),
+            "bm25_retriever": bm25_cls(document_store=ctx.store, top_k=p.fetch_k),
             "joiner": DocumentJoiner(
-                join_mode="reciprocal_rank_fusion", top_k=p.top_k
+                join_mode="reciprocal_rank_fusion", top_k=p.fetch_k
             ),
         },
         connections=[
@@ -935,6 +1012,9 @@ def build_inference_pipeline(
 
         query → [transform 鏈] → MultiQueryRetrievalStage(內部:retriever
         → ranker 鏈) → SubqueryFusion → ChatPromptBuilder → generator
+
+    ``generate_answer: false`` 時省略 ChatPromptBuilder 與 generator,
+    圖止於 SubqueryFusion(檢索-only)。
 
     Returns:
         ``(pipeline, meta)``;``meta["query_entry"]`` 是查詢文字的入口
@@ -1047,29 +1127,32 @@ def build_inference_pipeline(
     )
     outer.connect("multi_query.results", "fusion.results")
 
-    generation_method = _require_single("generation", inf.generation)
-    generation_factory = _resolve("generation", GENERATION_FACTORIES, generation_method)
-    generator, prompt_template, system_prompt = generation_factory.build(
-        inf.generation.params_for(generation_method), ctx
-    )
-    template_messages: list[ChatMessage] = []
-    if system_prompt:
-        template_messages.append(ChatMessage.from_system(system_prompt))
-    template_messages.append(
-        ChatMessage.from_user(prompt_template or DEFAULT_PROMPT_TEMPLATE)
-    )
-    outer.add_component(
-        "prompt_builder",
-        ChatPromptBuilder(
-            template=template_messages, required_variables=["query", "documents"]
-        ),
-    )
-    outer.add_component("generator", generator)
-    outer.connect("fusion.documents", "prompt_builder.documents")
-    if glossary_name is not None:
-        outer.connect(f"{glossary_name}.notes", "prompt_builder.glossary_notes")
-    outer.connect("prompt_builder.prompt", "generator.messages")
-    return outer, {"query_entry": query_entry}
+    if inf.generate_answer:
+        generation_method = _require_single("generation", inf.generation)
+        generation_factory = _resolve(
+            "generation", GENERATION_FACTORIES, generation_method
+        )
+        generator, prompt_template, system_prompt = generation_factory.build(
+            inf.generation.params_for(generation_method), ctx
+        )
+        template_messages: list[ChatMessage] = []
+        if system_prompt:
+            template_messages.append(ChatMessage.from_system(system_prompt))
+        template_messages.append(
+            ChatMessage.from_user(prompt_template or DEFAULT_PROMPT_TEMPLATE)
+        )
+        outer.add_component(
+            "prompt_builder",
+            ChatPromptBuilder(
+                template=template_messages, required_variables=["query", "documents"]
+            ),
+        )
+        outer.add_component("generator", generator)
+        outer.connect("fusion.documents", "prompt_builder.documents")
+        if glossary_name is not None:
+            outer.connect(f"{glossary_name}.notes", "prompt_builder.glossary_notes")
+        outer.connect("prompt_builder.prompt", "generator.messages")
+    return outer, {"query_entry": query_entry, "generate_answer": inf.generate_answer}
 
 
 def _load_native_pipeline(path: str) -> Pipeline:
@@ -1094,6 +1177,7 @@ class RagPipelines:
     inference: Pipeline
     store: Any
     query_entry: tuple[str, str] | None = None
+    generate_answer: bool = True
 
     def run_ingestion(self) -> dict[str, Any]:
         """執行 ingestion(來源資訊已在 config 中)。"""
@@ -1106,7 +1190,9 @@ class RagPipelines:
             dict:``answer``(回答文字)、``documents``(融合後切片)、
             ``subquery_results``(各子查詢重排後結果)、``prompt``
             (實際送出的 prompt,可稽核)、``reply_meta``(模型 /
-            finish_reason / usage 等)。
+            finish_reason / usage 等)。檢索-only 模式
+            (``generate_answer: false``)key 不變,但 ``answer`` /
+            ``prompt`` / ``reply_meta`` 為 ``None``。
 
         Raises:
             ConfigError: inference 由原生 Haystack YAML 載入
@@ -1119,24 +1205,27 @@ class RagPipelines:
                 "query() 便利介面不適用;請直接呼叫 .inference.run(...)"
             )
         entry_component, entry_socket = self.query_entry
-        data: dict[str, Any] = {
-            entry_component: {entry_socket: [text]},
-            "prompt_builder": {"query": text},
-        }
-        result = self.inference.run(
-            data, include_outputs_from={"fusion", "multi_query", "prompt_builder"}
-        )
-        reply = result["generator"]["replies"][0]
-        prompt_messages = result.get("prompt_builder", {}).get("prompt", [])
-        prompt_text = "\n\n".join(
-            message.text or "" for message in prompt_messages
-        )
+        data: dict[str, Any] = {entry_component: {entry_socket: [text]}}
+        include = {"fusion", "multi_query"}
+        if self.generate_answer:
+            data["prompt_builder"] = {"query": text}
+            include.add("prompt_builder")
+        result = self.inference.run(data, include_outputs_from=include)
+        answer = prompt_text = reply_meta = None
+        if self.generate_answer:
+            reply = result["generator"]["replies"][0]
+            prompt_messages = result.get("prompt_builder", {}).get("prompt", [])
+            prompt_text = "\n\n".join(
+                message.text or "" for message in prompt_messages
+            )
+            answer = reply.text
+            reply_meta = dict(reply.meta or {})
         return {
-            "answer": reply.text,
+            "answer": answer,
             "documents": result["fusion"]["documents"],
             "subquery_results": result["multi_query"]["results"],
             "prompt": prompt_text,
-            "reply_meta": dict(reply.meta or {}),
+            "reply_meta": reply_meta,
         }
 
 
@@ -1157,15 +1246,18 @@ def build_pipelines(config: RAGConfig, *, store: Any = None) -> RagPipelines:
         ingestion_pipeline, store = build_ingestion_pipeline(config, store=store)
 
     query_entry: tuple[str, str] | None = None
+    generate_answer = True
     if native is not None and native.inference is not None:
         inference_pipeline = _load_native_pipeline(native.inference)
     else:
         inference_pipeline, meta = build_inference_pipeline(config, store=store)
         query_entry = meta["query_entry"]
+        generate_answer = meta["generate_answer"]
     return RagPipelines(
         config=config,
         ingestion=ingestion_pipeline,
         inference=inference_pipeline,
         store=store,
         query_entry=query_entry,
+        generate_answer=generate_answer,
     )
