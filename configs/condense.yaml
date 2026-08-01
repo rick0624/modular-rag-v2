@@ -1,0 +1,99 @@
+# 檢索-only 配置:query condense → hybrid ES(候選放大)→ 兩段 rerank
+# → LLM 事實查核 → 去重排序取 top 3,不做答案生成。
+#
+# 流程:
+#   1. jargon_mapping:把查詢中的專業術語替換成直白描述(configs/jargon.json)
+#   2. llm_rewrite:LLM 把查詢改寫成更適合檢索的形式
+#   3. hybrid 檢索:ES BM25 + kNN,各取 top_k × boost_k_factor = 30 筆候選
+#   4. similarity rerank:cross-encoder 收斂到 top n(10 筆)
+#   5. llm_fact_check:LLM 對 query 與各切片做關聯分析,移除不相關者
+#   6. fusion:去重、按分數排序,回傳 top 3
+#   7. generate_answer: false:不做生成,query() 直接回傳 top 3 檢索文件
+#      (answer / prompt / reply_meta 為 None)
+#
+#   cp .env.example .env
+#   docker compose up -d          # 或指向既有的 ES 叢集
+#   python scripts/run_demo.py --config configs/condense.yaml
+#
+# 需要的環境變數:ES_URL、COMPANY_EMBEDDING_API_KEY、COMPANY_LLM_API_KEY
+
+ingestion:
+  import:
+    method: local_file
+    params:
+      input_dir: ./data/raw
+
+  parsing:
+    method: plain_text              # PDF 來源改:import 換 pdf_file、這裡換 pdf
+
+  chunking:
+    method: fixed_size
+    params:
+      split_length: 300
+      split_overlap: 50
+
+  embedding:
+    method: api_embedding           # 公司 embedding API(OpenAI 式回應)
+    method_params:
+      api_embedding:
+        endpoint: https://your-company-api.example.com/v1/embeddings
+        headers:
+          Authorization: Bearer ${COMPANY_EMBEDDING_API_KEY}
+        model: your-embedding-model # 閘道不接受 model 欄位時,刪掉此行即可
+        batch_size: 16
+        embeddings_field: data      # {"data": [{"embedding": [...]}]} 形狀
+        item_field: embedding
+
+  indexing:
+    method: elasticsearch           # 向量 + BM25 + filter 都在 ES 伺服器端
+    params:
+      hosts: ${ES_URL}
+      index: modular-rag-condense
+
+inference:
+  query_transformation:
+    method: [jargon_mapping, llm_rewrite]   # 先對照表替換術語,再 LLM 改寫
+    method_params:
+      jargon_mapping:
+        json_path: ./configs/jargon.json
+      llm_rewrite: {}
+        # 未指定 generator:沿用下方 generation 槽位的公司閘道
+        # prompt: |                  # 需要時可覆寫預設改寫 prompt(含 {{ query }})
+
+  retrieval:
+    method: hybrid                  # ES BM25 + kNN,RRF 融合
+    params:
+      top_k: 10
+      boost_k_factor: 3             # 候選放大:各 retriever 與 joiner 取 30 筆
+
+  reranking:
+    method: [similarity, llm_fact_check]
+    method_params:
+      similarity:                   # cross-encoder 收斂 30 → 10(top n)
+        model: cross-encoder/ms-marco-MiniLM-L-6-v2
+        top_k: 10
+      llm_fact_check: {}
+        # 未指定 generator:沿用 generation 槽位;只過濾不相關切片,
+        # 不重排、不改分。max_docs 可限制送查核的切片數。
+
+  generation:                       # 僅作為上方 LLM 方法的沿用連線來源
+    method: gateway_openai_compatible
+    method_params:
+      gateway_openai_compatible:
+        base_url: https://your-company-llm.example.com/v1
+        api_key: ${COMPANY_LLM_API_KEY}
+        # model 刻意不設定:公司閘道不接受 model 欄位,請求將不帶該欄位
+        temperature: 0.2
+      mock: {}                      # 離線試跑備援(切 method 即換)
+
+  generate_answer: false            # 檢索-only:不做答案生成
+
+  fusion:
+    group_by: none                  # 以切片為單位去重
+    strategy: rrf                   # 名次法:保序且不依賴上游分數
+    top_k: 3                        # 最終回傳 top 3
+
+evaluation:
+  method: basic_retrieval_metrics
+  params:
+    dataset_path: ./data/eval/qa.jsonl

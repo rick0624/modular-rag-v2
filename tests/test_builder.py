@@ -1,11 +1,16 @@
-"""builder 測試:未知方法、方法鏈規則、參數驗證、no_chunking。"""
+"""builder 測試:未知方法、方法鏈規則、參數驗證、no_chunking、
+boost_k_factor、檢索-only(generate_answer: false)。"""
 
 from __future__ import annotations
 
 import pytest
 from conftest import make_config
 
-from rag.builder import build_ingestion_pipeline, build_pipelines
+from rag.builder import (
+    build_inference_pipeline,
+    build_ingestion_pipeline,
+    build_pipelines,
+)
 from rag.config import parse_config
 from rag.errors import ConfigError, UnknownMethodError
 
@@ -99,6 +104,124 @@ def test_no_chunking_skips_splitter(corpus_dir):
     docs = store.filter_documents()
     # 每份文件恰好一個切片(seq 固定為 0)
     assert sorted(d.id for d in docs) == ["faiss.txt::chunk_0", "sub/es.txt::chunk_0"]
+
+
+class TestBoostKFactor:
+    def test_bm25_retriever_fetches_boosted_top_k(self):
+        config = parse_config(
+            make_config(
+                inference={
+                    "retrieval": {
+                        "method": "bm25",
+                        "params": {"top_k": 2, "boost_k_factor": 3},
+                    }
+                }
+            )
+        )
+        pipeline, _ = build_inference_pipeline(config)
+        inner = pipeline.get_component("multi_query").inner
+        assert inner.get_component("retriever").top_k == 6
+
+    def test_hybrid_boosts_both_retrievers_and_joiner(self):
+        config = parse_config(
+            make_config(
+                inference={
+                    "retrieval": {
+                        "method": "hybrid",
+                        "params": {"top_k": 4, "boost_k_factor": 3},
+                    }
+                }
+            )
+        )
+        pipeline, _ = build_inference_pipeline(config)
+        inner = pipeline.get_component("multi_query").inner
+        assert inner.get_component("bm25_retriever").top_k == 12
+        assert inner.get_component("embedding_retriever").top_k == 12
+        assert inner.get_component("joiner").top_k == 12
+
+    def test_default_factor_keeps_top_k(self):
+        config = parse_config(
+            make_config(inference={"retrieval": {"method": "bm25", "params": {"top_k": 5}}})
+        )
+        pipeline, _ = build_inference_pipeline(config)
+        inner = pipeline.get_component("multi_query").inner
+        assert inner.get_component("retriever").top_k == 5
+
+    def test_zero_factor_rejected(self):
+        config = parse_config(
+            make_config(
+                inference={
+                    "retrieval": {
+                        "method": "bm25",
+                        "params": {"top_k": 5, "boost_k_factor": 0},
+                    }
+                }
+            )
+        )
+        with pytest.raises(ConfigError, match="boost_k_factor"):
+            build_inference_pipeline(config)
+
+
+class TestFactCheckRegistration:
+    def test_unknown_rerank_method_lists_fact_check(self):
+        config = parse_config(
+            make_config(inference={"reranking": {"method": "factcheck"}})
+        )
+        with pytest.raises(UnknownMethodError, match="'llm_fact_check'"):
+            build_inference_pipeline(config)
+
+    def test_chained_after_llm_rerank(self):
+        config = parse_config(
+            make_config(
+                inference={
+                    "reranking": {
+                        "method": ["llm", "llm_fact_check"],
+                        "method_params": {},
+                    }
+                }
+            )
+        )
+        pipeline, _ = build_inference_pipeline(config)
+        inner = pipeline.get_component("multi_query").inner
+        from rag.components.fact_check import LLMFactChecker
+
+        assert inner.get_component("ranker") is not None
+        assert isinstance(inner.get_component("ranker_2"), LLMFactChecker)
+
+
+class TestSkipGeneration:
+    def test_missing_generation_with_default_flag_rejected(self):
+        data = make_config()
+        del data["inference"]["generation"]
+        with pytest.raises(ConfigError, match="generate_answer"):
+            parse_config(data)
+
+    def test_flag_false_omits_generator_and_prompt_builder(self):
+        config = parse_config(
+            make_config(inference={"generate_answer": False})
+        )
+        pipeline, meta = build_inference_pipeline(config)
+        components = pipeline.to_dict()["components"]
+        assert "generator" not in components
+        assert "prompt_builder" not in components
+        assert meta["generate_answer"] is False
+
+    def test_flag_false_without_generation_requires_explicit_generator(self):
+        # reranking 為 llm 且未指定 generator:沒有 generation 槽位可沿用
+        data = make_config(inference={"generate_answer": False})
+        del data["inference"]["generation"]
+        config = parse_config(data)
+        with pytest.raises(ConfigError, match="需要 chat generator"):
+            build_inference_pipeline(config)
+
+    def test_flag_false_with_generation_block_still_inherits(self):
+        # generation 區塊保留(mock)時,llm rerank 沿用成功
+        config = parse_config(
+            make_config(inference={"generate_answer": False})
+        )
+        pipeline, _ = build_inference_pipeline(config)
+        inner = pipeline.get_component("multi_query").inner
+        assert "ranker" in inner.to_dict()["components"]
 
 
 def test_native_pipeline_stage_requires_build_pipelines():
