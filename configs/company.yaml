@@ -14,9 +14,10 @@ ingestion:
     method: local_file
     params:
       input_dir: ./data/raw
+      extensions: [".txt", ".md"]   # 釘住純文字:parsing 用 plain_text 才合法
 
   parsing:
-    method: plain_text              # PDF 來源改:import 換 pdf_file、這裡換 pdf
+    method: plain_text              # 含 PDF 的語料改:extensions 放開、這裡換 auto
 
   chunking:
     method: fixed_size

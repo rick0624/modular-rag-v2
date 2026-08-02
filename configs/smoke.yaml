@@ -9,6 +9,7 @@ ingestion:
     method: local_file
     params:
       input_dir: ./data/raw
+      extensions: [".txt", ".md"]   # 釘住純文字:parsing 用 plain_text 才合法
   parsing:
     method: [plain_text, clean]     # 方法鏈:轉 Document 後再清理
   chunking:

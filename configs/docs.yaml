@@ -1,0 +1,134 @@
+# 自己的文件(txt / md / pdf 混放皆可):condense.yaml 的混合 KB 版本(檢索-only)。
+#
+# 只有兩處與 condense.yaml 不同 —— import 不限型別、parsing 用 auto 分流;
+# 其餘(embedding / ES / 改寫 / 重排 / 事實查核 / fusion)完全相同。
+#
+#   1. 把文件(txt / md / pdf)放進 ./data/docs/(子資料夾也會被掃到)
+#   2. python scripts/run_demo.py --config configs/docs.yaml --query "你的問題"
+#
+# 需要的環境變數:OPENAI_API_KEY
+#
+# 注意:未啟用的示範區塊使用「字面值占位符」(如 YOUR_TOKEN),不用
+# ${ENV_VAR} —— 因為 ${} 會在載入時立刻展開,引用未設定的變數即使在
+# 未使用的區塊也會報錯。
+
+ingestion:
+  import:
+    method: local_file              # 預設收 .txt/.md/.pdf;recursive: true 含子資料夾
+    params:
+      input_dir: ./data/docs
+
+  parsing:
+    method: auto                    # 依檔案類型分流(pdf 會產生頁碼 meta)
+    params:
+      # force:PDF 全頁 OCR(需 pip install -e ".[ocr]")。榜單這類多欄
+      # 表格版面,pypdf 文字層順序是亂的(標題與其下方編號相隔數百字元),
+      # OCR 按視覺位置輸出才能保持相鄰。掃描檔(無文字層)也靠它。
+      # 成本約每頁數秒 —— 搭配 indexing.incremental: true,檔案沒變的
+      # 後續 ingest 連 parse 都跳過,只有第一次(或檔案變更時)要付。
+      # 引號不可省:YAML 把裸寫的 off/on/yes/no 解析成布林值
+      ocr: "off"
+    # method: [auto, clean]         # 版面雜訊多時改用鏈:分流後再清空白
+
+  chunking:
+    method: fixed_size              # 也可改 page_based(一頁一切片)或 structure_based
+    params:
+      split_length: 300
+      split_overlap: 50
+
+  embedding:
+    method: api_embedding
+    method_params:
+      api_embedding:
+        endpoint: https://api.openai.com/v1/embeddings
+        headers:
+          Authorization: Bearer ${OPENAI_API_KEY}
+        model: text-embedding-3-small
+        batch_size: 16
+        embeddings_field: data
+        item_field: embedding
+
+  indexing:
+    method: elasticsearch
+    params:
+      hosts: http://localhost:9200
+      # 獨立索引:跟範例語料分開,查詢結果才不會混進 faiss.txt 那些切片
+      index: modular-rag-docs
+      # 增量 ingest:內容未變的切片跳過 embedding 與寫入(新增檔案時
+      # POST /ingest 只花新檔案的 embedding 成本)
+      incremental: true
+
+inference:
+  query_transformation:
+    method: [jargon_mapping, llm_rewrite]
+    method_params:
+      jargon_mapping:
+        json_path: ./configs/jargon.json
+      llm_rewrite:
+        # 覆寫預設改寫 prompt:KB 同時有中文與英文文件(榜單、英文教材),
+        # 中文問題查英文內容會整批 miss —— 改寫時加入英文關鍵詞打通。
+        prompt: |
+          你是文獻檢索專家。把下面的使用者問題改寫成一條乾淨、清晰、適合檢索的問題。
+          規則:
+          - 保留原意,不要新增問題中沒有的資訊。
+          - 不要改動專有名詞與術語。
+          - 知識庫同時含中文與英文文件。若問題可能指向英文文件(章節、
+            習題、英文教材…),改寫成中英關鍵詞並存的檢索句,例如
+            「10.7章節的第四題」→「10.7 exercises question 4 第四題 題目」。
+          - 只輸出 JSON,格式:{"rewritten_query": "改寫後的問題", "reason": "改寫理由"}。
+
+          問題:{{ query }}
+
+  retrieval:
+    method: hybrid
+    params:
+      top_k: 10
+      boost_k_factor: 3
+
+  reranking:
+    method: [similarity, llm_fact_check]
+    method_params:
+      similarity:
+        # 多語模型(含中文)。英文的 ms-marco-MiniLM 對中文毫無鑑別力
+        # (分數全 0.99+,等於隨機排序),中文語料千萬別用。
+        # 品質更好但更大更慢的選項:BAAI/bge-reranker-v2-m3(約 2.3GB)
+        model: cross-encoder/mmarco-mMiniLMv2-L12-H384-v1
+        top_k: 10
+      llm_fact_check:
+        # 覆寫預設查核 prompt:榜單/清單型資料的「內容」就是編號清單,
+        # 預設 prompt 會因為「問名單但片段只有編號沒有人名」而誤殺。
+        prompt: |
+          判斷下列每個片段是否與問題相關。
+          規則:
+          - 片段只要包含問題所指主題的資料就算相關。例如問「某系所的
+            錄取名單」時,含該系所名稱及其正取/備取編號清單的片段都算
+            相關 —— 編號清單本身就是名單的內容,不需要出現人名。
+          - 寧可保留也不要誤刪:不確定時視為相關。
+          - 只輸出 JSON,格式:{"relevant_indices": [1, 3]},列出相關片
+            段的 1 起編號;沒有任何相關片段時輸出 {"relevant_indices": []}。
+
+          問題:{{ query }}
+
+          片段:
+          {{ documents }}
+
+  generation:                       # 僅作為上方 LLM 方法的沿用連線來源
+    method: openai
+    method_params:
+      openai:
+        model: gpt-5-nano
+      gateway_openai_compatible:
+        base_url: https://llm.example.com/v1
+        api_key: YOUR_TOKEN
+      mock: {}
+
+  generate_answer: true            # 要看生成的答案就改成 true
+
+  fusion:
+    group_by: none                  # 想看「命中哪幾份文件」可改 doc
+    strategy: rrf
+    top_k: 3
+
+# evaluation 刻意省略:內建的 qa.jsonl 是給範例語料用的,對你的文件沒有意義。
+# 要評估請自備 JSONL(每行 {"query": ..., "relevant_doc_ids": [...]}),
+# doc_id 就是檔案相對 input_dir 的路徑,例如 "manual.pdf"。

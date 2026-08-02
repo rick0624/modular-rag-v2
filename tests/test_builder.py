@@ -92,7 +92,7 @@ def test_no_chunking_skips_splitter(corpus_dir):
             ingestion={
                 "import": {
                     "method": "local_file",
-                    "params": {"input_dir": str(corpus_dir)},
+                    "params": {"input_dir": str(corpus_dir), "extensions": [".txt"]},
                 },
                 "chunking": {"method": "no_chunking"},
             }
@@ -247,7 +247,7 @@ class TestEscapeHatch:
             ingestion={
                 "import": {
                     "method": "local_file",
-                    "params": {"input_dir": str(corpus_dir)},
+                    "params": {"input_dir": str(corpus_dir), "extensions": [".txt"]},
                 }
             }
         )
@@ -273,7 +273,7 @@ class TestEscapeHatch:
             ingestion={
                 "import": {
                     "method": "local_file",
-                    "params": {"input_dir": str(corpus_dir)},
+                    "params": {"input_dir": str(corpus_dir), "extensions": [".txt"]},
                 }
             }
         )

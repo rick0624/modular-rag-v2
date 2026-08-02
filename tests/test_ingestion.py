@@ -23,7 +23,7 @@ class TestTextIngestion:
                 ingestion={
                     "import": {
                         "method": "local_file",
-                        "params": {"input_dir": str(corpus_dir)},
+                        "params": {"input_dir": str(corpus_dir), "extensions": [".txt"]},
                     },
                     "chunking": {
                         "method": "fixed_size",
@@ -53,7 +53,7 @@ class TestTextIngestion:
                 ingestion={
                     "import": {
                         "method": "local_file",
-                        "params": {"input_dir": str(corpus_dir)},
+                        "params": {"input_dir": str(corpus_dir), "extensions": [".txt"]},
                     },
                     "chunking": {
                         "method": "fixed_size",
@@ -78,7 +78,7 @@ class TestTextIngestion:
             ingestion={
                 "import": {
                     "method": "local_file",
-                    "params": {"input_dir": str(corpus_dir)},
+                    "params": {"input_dir": str(corpus_dir), "extensions": [".txt"]},
                 },
             }
         )
@@ -94,7 +94,7 @@ class TestTextIngestion:
                 ingestion={
                     "import": {
                         "method": "local_file",
-                        "params": {"input_dir": str(corpus_dir)},
+                        "params": {"input_dir": str(corpus_dir), "extensions": [".txt"]},
                     },
                     "chunking": {
                         "method": "structure_based",
@@ -113,7 +113,10 @@ class TestPdfIngestion:
     def _pdf_config(self, pdf_dir, chunking):
         return make_config(
             ingestion={
-                "import": {"method": "pdf_file", "params": {"input_dir": str(pdf_dir)}},
+                "import": {
+                    "method": "local_file",
+                    "params": {"input_dir": str(pdf_dir), "extensions": [".pdf"]},
+                },
                 "parsing": {"method": "pdf"},
                 "chunking": chunking,
             }

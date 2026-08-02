@@ -20,7 +20,7 @@ def _condense_config(corpus_dir, **top_level):
             ingestion={
                 "import": {
                     "method": "local_file",
-                    "params": {"input_dir": str(corpus_dir)},
+                    "params": {"input_dir": str(corpus_dir), "extensions": [".txt"]},
                 },
             },
             inference={

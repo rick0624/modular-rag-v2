@@ -14,7 +14,12 @@ import pytest
 
 BASE_CONFIG: dict[str, Any] = {
     "ingestion": {
-        "import": {"method": "local_file", "params": {"input_dir": "./data/raw"}},
+        # extensions 釘住純文字:讓既有測試持續走 plain_text 路徑
+        # (local_file 預設收 txt/md/pdf → mixed,那需要 auto parsing)
+        "import": {
+            "method": "local_file",
+            "params": {"input_dir": "./data/raw", "extensions": [".txt", ".md"]},
+        },
         "parsing": {"method": "plain_text"},
         "chunking": {"method": "fixed_size"},
         "embedding": {"method": "mock", "params": {"dim": 16}},
@@ -102,6 +107,19 @@ def pdf_dir(tmp_path):
         minimal_two_page_pdf("Alpha vector search page", "Beta keyword ranking page")
     )
     return pdfs
+
+
+@pytest.fixture
+def mixed_corpus_dir(corpus_dir):
+    """txt(含子資料夾)+ md + pdf 混放的語料夾(測 auto 分流)。"""
+    (corpus_dir / "notes.md").write_text(
+        "# RAG 筆記\n\n檢索增強生成先檢索相關內容,再交給 LLM 作答。",
+        encoding="utf-8",
+    )
+    (corpus_dir / "manual.pdf").write_bytes(
+        minimal_two_page_pdf("Alpha vector search page", "Beta keyword ranking page")
+    )
+    return corpus_dir
 
 
 class FakeResponse:

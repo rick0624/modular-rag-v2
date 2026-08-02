@@ -67,9 +67,13 @@ class SubqueryFusion:
         # config 有 fusion 區塊時為 True:單一查詢也走融合(可做 doc/page 聚合)。
         self.always_fuse = always_fuse
 
-    @component.output_types(documents=list[Document])
+    @component.output_types(documents=list[Document], applied=bool)
     def run(self, results: list[list[Document]]) -> dict[str, Any]:
         """融合 N 路結果(N ≥ 1);單路且未設定 fusion 時原樣通過。
+
+        ``applied`` 指出這次是否真的做了融合 —— 元件恆存在於 pipeline
+        中,穿透時也會出現在 trace,靠這個旗標才分得出「融合過」與
+        「只是路過」,否則紀錄會讓人誤以為做了去重 / 聚合 / 排序。
 
         Raises:
             ComponentError: ``results`` 為空(上游沒有任何檢索結果)。
@@ -77,7 +81,7 @@ class SubqueryFusion:
         if not results:
             raise ComponentError("沒有任何檢索結果可融合")
         if len(results) == 1 and not self.always_fuse:
-            return {"documents": results[0]}
+            return {"documents": results[0], "applied": False}
 
         groups: dict[str, dict[str, Any]] = {}
         order = 0
@@ -123,4 +127,4 @@ class SubqueryFusion:
             )
             for key, group in ranked[: self.top_k]
         ]
-        return {"documents": fused}
+        return {"documents": fused, "applied": True}

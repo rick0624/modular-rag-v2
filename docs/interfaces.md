@@ -45,8 +45,11 @@ ES 的 `_id` 可預測。代價:切片內容在 stamper 之後**不得再改動*
 ## 3. 槽位輸入輸出(Haystack 語境)
 
 ```
-Ingestion:  import(FileLister) → sources+meta → parsing(converter[→processor…])
+Ingestion:  import(FileLister) [→ SourceChangeFilter(檔案層增量)]
+            → sources+meta → parsing(converter[→processor…];pdf 走
+            PdfToDocument = pypdf 文字層 + 選擇性 OCR)
             → documents → chunking(splitter) → ChunkMetaStamper
+            [→ IncrementalChangeFilter(切片層增量)]
             → embedding(document embedder) → DocumentWriter(store)
 
 Inference:  query:str → query_transformation 鏈(list[str] → list[str])
@@ -61,7 +64,7 @@ Evaluation: JSONL 測試集 → 逐題 RagPipelines.query() → hit_rate / MRR
 | 槽位 | 輸入 → 輸出 | 方法鏈 |
 |---|---|---|
 | import | (params)→ `sources: list[str]` + `meta: list[dict]` | ✗ |
-| parsing | sources → `documents`(鏈首 converter,其餘 Document→Document) | ✓ |
+| parsing | sources → `documents`(鏈首 converter,其餘 Document→Document)。鏈首可展開為**內部圖**(`auto`:FileTypeRouter → 多 converter → DocumentJoiner),對外契約不變 | ✓ |
 | chunking | documents → documents(splitter;`no_chunking` = 無節點) | ✗ |
 | embedding | factory 一次建 (document_embedder, text_embedder) 一對 | ✗ |
 | indexing | factory 回傳 document store(+ 能力宣告) | ✗ |
@@ -76,25 +79,50 @@ Evaluation: JSONL 測試集 → 逐題 RagPipelines.query() → hit_rate / MRR
 方法在 factory 表上宣告、`rag/compatibility.py` 在建構期檢查,
 不合法組合直接報錯並列出可相容替代:
 
-1. **content_type**:import 宣告 `output_content_type`,parsing 鏈首
-   宣告 `input_content_types`。
+1. **content_type**:import 宣告 `output_content_type`(靜態)或
+   `output_content_type_fn`(動態:`local_file` 依 `extensions` 推導
+   —— 同質 → `text` / `pdf`,異質 → `mixed`);parsing 鏈首宣告
+   `input_content_types`(`auto` 接受全部三種)。
 2. **pages**:chunking 宣告 `requires_pages`,parsing 鏈任一環節
    `produces_pages` 即滿足。
 3. **索引能力**:indexing 宣告 `capabilities`(`vector_search` /
    `text_search` / `metadata_filter` / `incremental_update`),
    retrieval 宣告 `required_capabilities`,需為子集。
+   `indexing.params.incremental: true`(增量 ingest,兩層:importer 後的
+   `SourceChangeFilter` 按檔案雜湊跳過未變檔案的 parse;stamper 後的
+   `IncrementalChangeFilter` 按 chunk_id 比對內容跳過 embedding)需要
+   `incremental_update` 能力。檔案 manifest 帶 parse 設定雜湊,設定
+   變更即作廢(全量重 parse)。
 
 新增相容性維度:在 `SlotFactory` 加宣告欄位、`compatibility.py`
 補一條檢查即可。
 
-## 5. 新需求進來時怎麼判斷
+## 5. 服務模式不變量(`rag/service.py` + `rag/kb_meta.py`)
+
+- **索引內容必須與 ingestion 設定一致**。強制機制:ingestion 指紋 =
+  對「展開前」的原始 config dict 取 `{ingestion, haystack_pipelines.ingestion}`
+  區塊,`json.dumps(sort_keys=True)` 後 sha256。展開前計算 →
+  `${ENV_VAR}` 機密不進雜湊;解析後的 dict → 註解 / 排版 / anchor
+  重構不影響。已知盲區:env var **值**的輪替、escape-hatch pipeline
+  檔的內容變更。
+- 儲存位置:`elasticsearch` → index mapping `_meta`(跟索引走);
+  其他 → store 物件屬性(單 process 內有效)。
+- `/reload` 只重建 inference(store 沿用);指紋不符 → **409**,
+  導向 `/ingest`。**`/ingest` 是 ingestion 設定變更的唯一通道**
+  (全新 store、兩條 pipeline 全重建、成功後才更新指紋)。
+- 單 process、單 worker;pipeline 執行與狀態切換以同一把 lock 序列化。
+
+## 6. 新需求進來時怎麼判斷
 
 1. **是「同一槽位的另一種做法」嗎?**(換 LLM、新切法、新指標)
    → 新增方法:寫元件(或直接用 Haystack 現成元件)+ factory +
    對映表加一行。九成需求在這裡,見 README「新增自訂方法」。
 2. **是「資料要多帶一點資訊」嗎?**(新的追溯欄位)
    → 加 meta 鍵:只加不改,舊元件不讀新鍵也不會壞。
-3. **真的是「流程本身多一個步驟」嗎?**
+3. **是「新的檔案型別」嗎?**(docx、html…)
+   → `builder.py` 的 `_EXTENSION_CONTENT_TYPES` 加副檔名對映 +
+   `auto` 的 ParsingGraph 加一條 router 分支(mime type + converter)。
+4. **真的是「流程本身多一個步驟」嗎?**
    → 先想能不能作為既有槽位的方法或 fusion 類內建步驟;真的要改圖,
    改 `builder.py` 的組裝邏輯(這正是薄 builder 存在的意義);
    極端形狀走 `haystack_pipelines` escape hatch。

@@ -203,8 +203,10 @@ class LLMQueryRewriter:
     def _rewrite(self, query: str) -> str:
         prompt = self.prompt.replace("{{ query }}", query)
         try:
+            logger.debug("查詢改寫 prompt:\n%s", prompt)
             result = self.chat_generator.run(messages=[ChatMessage.from_user(prompt)])
             reply_text = result["replies"][0].text or ""
+            logger.debug("查詢改寫回覆:%s", reply_text)
         except Exception as exc:  # fail-soft:LLM 故障不可中斷查詢路徑
             logger.warning("查詢改寫失敗(%s: %s),退回原查詢", type(exc).__name__, exc)
             return query
@@ -255,8 +257,10 @@ class LLMQueryDecomposer:
             "{max_subqueries}", str(self.max_subqueries)
         )
         try:
+            logger.debug("查詢拆解 prompt:\n%s", prompt)
             result = self.chat_generator.run(messages=[ChatMessage.from_user(prompt)])
             reply_text = result["replies"][0].text or ""
+            logger.debug("查詢拆解回覆:%s", reply_text)
         except Exception as exc:  # fail-soft:LLM 故障不可中斷查詢路徑
             logger.warning("查詢拆解失敗(%s: %s),退回原查詢", type(exc).__name__, exc)
             return [query]

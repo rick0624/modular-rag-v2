@@ -97,10 +97,22 @@ class MethodConfig(BaseModel):
         default_factory=dict,
         description="當前 method 的參數(扁平寫法;方法鏈時必須為空)",
     )
-    method_params: dict[str, dict[str, Any]] = Field(
+    method_params: dict[str, dict[str, Any] | None] = Field(
         default_factory=dict,
         description="各方法專屬參數,以方法名稱分區;切換 method 時互不干擾",
     )
+
+    @field_validator("method_params", mode="after")
+    @classmethod
+    def _null_block_is_empty(
+        cls, value: dict[str, dict[str, Any] | None]
+    ) -> dict[str, dict[str, Any]]:
+        """把 ``None`` 區塊視為空參數。
+
+        參數全被註解掉的區塊在 YAML 中是 ``null`` 而非 ``{}``
+        (型錄式 config 很常見),不該因此驗證失敗。
+        """
+        return {key: (block or {}) for key, block in value.items()}
 
     @field_validator("method")
     @classmethod
@@ -292,6 +304,31 @@ def parse_config(data: Any, source: str = "<dict>") -> RAGConfig:
         return RAGConfig.model_validate(data)
     except ValidationError as exc:
         raise ConfigError(_format_validation_error(exc, source)) from exc
+
+
+def load_raw_config(path: str | Path) -> dict[str, Any]:
+    """讀取 YAML 為原始 dict:不載入 .env、不展開 ``${ENV_VAR}``、不驗證。
+
+    供 ingestion 指紋(:mod:`rag.kb_meta`)使用 —— 指紋必須以「展開前」
+    的內容計算,機密才不會進雜湊;也因為回傳的是解析後的 dict,
+    註解、排版與 YAML anchor 的重構都不影響指紋。
+
+    Raises:
+        ConfigError: 檔案不存在、YAML 語法錯誤,或頂層不是 mapping。
+    """
+    config_path = Path(path)
+    if not config_path.is_file():
+        raise ConfigError(f"找不到設定檔:{config_path}")
+    try:
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"設定檔 '{config_path}' 不是合法的 YAML:{exc}") from exc
+    if not isinstance(data, dict):
+        raise ConfigError(
+            f"配置 '{config_path}' 的頂層必須是 mapping(YAML 物件),"
+            f"實際得到:{type(data).__name__}"
+        )
+    return data
 
 
 def load_config(

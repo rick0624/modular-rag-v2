@@ -143,7 +143,7 @@ class TestEndToEndEvaluation:
                 ingestion={
                     "import": {
                         "method": "local_file",
-                        "params": {"input_dir": str(corpus_dir)},
+                        "params": {"input_dir": str(corpus_dir), "extensions": [".txt"]},
                     }
                 },
                 evaluation={
@@ -165,6 +165,35 @@ class TestConfigFilesParse:
     def test_default_yaml_parses(self):
         config = load_config(CONFIGS_DIR / "default.yaml", dotenv_path=None)
         assert config.ingestion.embedding.method == "mock"
+        # 型錄性質:每個槽位都要並存展示所有可用方法
+        from rag import builder
+
+        for cfg, table in [
+            (config.ingestion.parsing, builder.PARSING_FACTORIES),
+            (config.ingestion.chunking, builder.CHUNKING_FACTORIES),
+            (config.ingestion.embedding, builder.EMBEDDING_FACTORIES),
+            (config.ingestion.indexing, builder.INDEXING_FACTORIES),
+            (config.inference.query_transformation, builder.TRANSFORM_FACTORIES),
+            (config.inference.retrieval, builder.RETRIEVAL_FACTORIES),
+            (config.inference.reranking, builder.RERANKING_FACTORIES),
+            (config.inference.generation, builder.GENERATION_FACTORIES),
+        ]:
+            missing = set(table) - set(cfg.method_params)
+            assert not missing, f"default.yaml 型錄缺少方法區塊:{sorted(missing)}"
+
+    def test_all_commented_block_is_treated_as_empty(self):
+        """參數全被註解掉的區塊在 YAML 中是 null,不該驗證失敗(型錄常見)。"""
+        config = parse_config(
+            make_config(
+                ingestion={
+                    "indexing": {
+                        "method": "in_memory",
+                        "method_params": {"in_memory": None},
+                    }
+                }
+            )
+        )
+        assert config.ingestion.indexing.params_for("in_memory") == {}
 
     def test_smoke_yaml_parses(self):
         config = load_config(CONFIGS_DIR / "smoke.yaml", dotenv_path=None)
@@ -181,10 +210,16 @@ class TestConfigFilesParse:
         assert gateway["api_key"] == "k2"
         assert "model" not in gateway
 
+    def test_docs_yaml_parses_with_env(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "k1")
+        config = load_config(CONFIGS_DIR / "docs.yaml", dotenv_path=None)
+        assert config.ingestion.import_.method == "local_file"
+        assert config.ingestion.parsing.method == "auto"
+        assert config.ingestion.indexing.params_for()["index"] == "modular-rag-docs"
+        assert config.evaluation is None  # 內建評估集對自備文件沒有意義
+
     def test_condense_yaml_parses_with_env(self, monkeypatch):
-        monkeypatch.setenv("ES_URL", "http://localhost:9200")
-        monkeypatch.setenv("COMPANY_EMBEDDING_API_KEY", "k1")
-        monkeypatch.setenv("COMPANY_LLM_API_KEY", "k2")
+        monkeypatch.setenv("OPENAI_API_KEY", "k1")
         config = load_config(CONFIGS_DIR / "condense.yaml", dotenv_path=None)
         assert config.inference.generate_answer is False
         assert config.inference.query_transformation.methods() == [

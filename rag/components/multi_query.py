@@ -13,6 +13,8 @@ from typing import Any
 
 from haystack import Document, Pipeline, component
 
+from rag.trace import step_order
+
 
 @component
 class MultiQueryRetrievalStage:
@@ -35,14 +37,31 @@ class MultiQueryRetrievalStage:
         self.query_targets = list(query_targets)
         self.output_component = output_component
 
-    @component.output_types(results=list[list[Document]])
+    @component.output_types(results=list[list[Document]], traces=list[dict[str, Any]])
     def run(self, queries: list[str]) -> dict[str, Any]:
         results: list[list[Document]] = []
+        traces: list[dict[str, Any]] = []
+        step_names = step_order(self.inner)
         for query in queries:
             data = {
                 component_name: {input_name: query}
                 for component_name, input_name in self.query_targets
             }
-            output = self.inner.run(data)
+            # 收集全部元件輸出:每段檢索 / 重排的中間結果都要可稽核,
+            # 否則內部 pipeline 對呼叫端是黑箱。
+            output = self.inner.run(data, include_outputs_from=set(step_names))
             results.append(output[self.output_component]["documents"])
-        return {"results": results}
+            steps = []
+            for name in step_names:
+                documents = (output.get(name) or {}).get("documents")
+                if documents is None:  # 非 documents 型元件(如 query embedder)
+                    continue
+                steps.append(
+                    {
+                        "component": name,
+                        "type": type(self.inner.get_component(name)).__name__,
+                        "documents": list(documents),
+                    }
+                )
+            traces.append({"query": query, "steps": steps})
+        return {"results": results, "traces": traces}

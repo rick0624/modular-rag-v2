@@ -45,7 +45,7 @@ class ChunkMetaStamper:
             if not doc_id:
                 raise ComponentError(
                     "切片缺少 meta['doc_id'],無法產生穩定的 chunk_id。"
-                    "請確認 import 槽位使用會提供 doc_id 的方法(如 local_file / pdf_file),"
+                    "請確認 import 槽位使用會提供 doc_id 的方法(如 local_file),"
                     f"目前的 meta 欄位:{sorted(doc.meta.keys())}"
                 )
             seq = seq_counters.get(doc_id, 0)

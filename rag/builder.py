@@ -13,9 +13,10 @@
 from __future__ import annotations
 
 import importlib.util
+import logging
 from dataclasses import dataclass, field as dc_field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from haystack import Pipeline
 from haystack.components.builders import ChatPromptBuilder
@@ -30,7 +31,14 @@ from haystack.components.writers import DocumentWriter
 from haystack.dataclasses import ChatMessage
 from haystack.document_stores.in_memory import InMemoryDocumentStore
 from haystack.document_stores.types import DuplicatePolicy
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from rag.compatibility import (
     validate_chunking_compatibility,
@@ -41,7 +49,10 @@ from rag.components.api_embedders import (
     FlexibleAPIDocumentEmbedder,
     FlexibleAPITextEmbedder,
 )
+from rag.components.change_filter import IncrementalChangeFilter
 from rag.components.file_lister import FileLister
+from rag.components.pdf_ocr import PdfToDocument
+from rag.components.source_filter import SourceChangeFilter
 from rag.components.fusion import SubqueryFusion
 from rag.components.gateway_generator import GatewayChatGenerator, MockChatGenerator
 from rag.components.meta_stamper import ChunkMetaStamper
@@ -58,7 +69,15 @@ from rag.components.query_transforms import (
     QueryNormalizer,
 )
 from rag.config import FusionConfig, MethodConfig, RAGConfig
-from rag.errors import ConfigError, MissingDependencyError, UnknownMethodError
+from rag.errors import (
+    ConfigError,
+    IncompatiblePipelineError,
+    MissingDependencyError,
+    UnknownMethodError,
+)
+from rag.trace import step_order
+
+logger = logging.getLogger(__name__)
 
 # 輸入輸出同型別、支援方法鏈(method 清單)的槽位。
 CHAINABLE_SLOTS = frozenset({"parsing", "query_transformation", "reranking"})
@@ -80,7 +99,10 @@ class SlotFactory:
 
     build: Callable[[dict[str, Any], "BuildContext"], Any]
     kind: str = ""  # parsing 鏈用:"converter"(檔案→Document)/ "doc_processor"
-    output_content_type: str | None = None  # import 槽位宣告
+    output_content_type: str | None = None  # import 槽位宣告(靜態)
+    output_content_type_fn: Callable[[dict[str, Any]], str] | None = None
+    """import 槽位宣告(動態):依方法參數推導 content_type(如 local_file
+    依 extensions 推導 text / pdf / mixed);設定時優先於靜態宣告。"""
     input_content_types: frozenset[str] = frozenset()  # parsing 槽位宣告
     produces_pages: bool = False  # parsing 槽位宣告
     requires_pages: bool = False  # chunking 槽位宣告
@@ -147,6 +169,36 @@ def _require_single(slot: str, cfg: MethodConfig) -> str:
 # ---------------------------------------------------------------------------
 
 
+# local_file 支援的副檔名 → content_type 對映。新增檔案型別時:
+# 這裡加一列 + `auto` parsing 的 ParsingGraph 加一條分支。
+_EXTENSION_CONTENT_TYPES: dict[str, str] = {
+    ".txt": "text",
+    ".md": "text",
+    ".pdf": "pdf",
+}
+_LOCAL_FILE_DEFAULT_EXTENSIONS = list(_EXTENSION_CONTENT_TYPES)
+
+
+def _local_file_output_type(params: dict[str, Any]) -> str:
+    """依 extensions 參數推導 import 輸出的 content_type。
+
+    同質(全 text 或全 pdf)→ 該型別;異質 → ``"mixed"``(此時 parsing
+    需用 ``auto`` 分流)。藉此保留建構期檢查:extensions 收窄成單一型別
+    時,單型別 parser(plain_text / pdf)仍然合法。
+    """
+    extensions = [
+        ext.lower() for ext in (params.get("extensions") or _LOCAL_FILE_DEFAULT_EXTENSIONS)
+    ]
+    unknown = sorted(set(extensions) - set(_EXTENSION_CONTENT_TYPES))
+    if unknown:
+        raise ConfigError(
+            f"import 方法 'local_file' 不支援副檔名 {unknown};"
+            f"目前支援:{sorted(_EXTENSION_CONTENT_TYPES)}"
+        )
+    types = {_EXTENSION_CONTENT_TYPES[ext] for ext in extensions}
+    return next(iter(types)) if len(types) == 1 else "mixed"
+
+
 class _FileListerParams(BaseParams):
     input_dir: str = Field(description="要匯入的資料夾路徑")
     extensions: list[str] | None = Field(
@@ -181,15 +233,32 @@ def _build_plain_text(raw: dict[str, Any], ctx: BuildContext) -> Any:
     return TextFileToDocument(encoding=p.encoding)
 
 
+def _normalize_ocr_mode(value: Any) -> Any:
+    """把 YAML 解析出的布林還原成 OCR 模式字串。
+
+    YAML 1.1 把裸寫的 ``off`` / ``on`` / ``no`` / ``yes`` 解析成布林,
+    ``ocr: off`` 到這裡會是 ``False`` —— 這是使用者最直覺的寫法,
+    直接接受(``False`` → "off"、``True`` → "force"),不必強迫加引號。
+    """
+    if isinstance(value, bool):
+        return "force" if value else "off"
+    return value
+
+
 class _PdfParams(BaseParams):
-    pass
+    ocr: Literal["off", "auto", "force"] = Field(
+        default="auto",
+        description="OCR 策略:off=純 pypdf;auto=掃描頁(無文字層)才 OCR;"
+        "force=全頁 OCR(多欄/表格版面順序亂時用)。需 pip install -e \".[ocr]\"",
+    )
+    ocr_scale: float = Field(default=2.0, gt=0, description="OCR 前的頁面渲染倍率")
+
+    _normalize_ocr = field_validator("ocr", mode="before")(_normalize_ocr_mode)
 
 
 def _build_pdf(raw: dict[str, Any], ctx: BuildContext) -> Any:
-    from haystack.components.converters.pypdf import PyPDFToDocument
-
-    _validate_params("parsing", "pdf", _PdfParams, raw)
-    return PyPDFToDocument()
+    p = _validate_params("parsing", "pdf", _PdfParams, raw)
+    return PdfToDocument(mode=p.ocr, ocr_scale=p.ocr_scale)
 
 
 class _CleanParams(BaseParams):
@@ -204,6 +273,74 @@ def _build_clean(raw: dict[str, Any], ctx: BuildContext) -> Any:
         remove_empty_lines=p.remove_empty_lines,
         remove_extra_whitespaces=p.remove_extra_whitespaces,
         remove_repeated_substrings=p.remove_repeated_substrings,
+    )
+
+
+@dataclass
+class ParsingGraph:
+    """parsing 鏈首方法展開後的內部圖片段(多分支 converter)。
+
+    仿 :class:`_RetrievalGraph`:factory 回傳圖描述,由
+    :func:`build_ingestion_pipeline` 展開接線。對外契約不變 ——
+    輸入 ``sources`` + ``meta``、輸出 ``documents``。
+    """
+
+    components: dict[str, Any]  # 相對名稱 → 元件
+    connections: list[tuple[str, str]]  # 圖內接線("元件.socket" 相對名)
+    sources_target: tuple[str, str]  # importer.sources 的落點
+    meta_target: tuple[str, str]  # importer.meta 的落點
+    output: str  # 輸出 documents 的元件(相對名稱)
+
+
+class _AutoParsingParams(BaseParams):
+    encoding: str = Field(default="utf-8", description="文字 / Markdown 檔編碼")
+    ocr: Literal["off", "auto", "force"] = Field(
+        default="auto", description="pdf 分支的 OCR 策略(同 pdf 方法的 ocr 參數)"
+    )
+    ocr_scale: float = Field(default=2.0, gt=0, description="OCR 前的頁面渲染倍率")
+
+    _normalize_ocr = field_validator("ocr", mode="before")(_normalize_ocr_mode)
+
+
+def _build_auto(raw: dict[str, Any], ctx: BuildContext) -> ParsingGraph:
+    """依檔案類型分流:txt/md → 文字 converter、pdf → PyPDF,再合流。
+
+    FileTypeRouter 在 meta 非空時會把來源轉成 ByteStream 並 merge meta,
+    因此 FileLister 的 doc_id 隨 ByteStream 流進各 converter,meta 契約
+    不受分流影響。txt 與 md 各用一個 TextFileToDocument 實例:converter
+    的 sources 輸入不是 variadic,兩個 router socket 不能餵同一個實例。
+    """
+    from haystack.components.converters.txt import TextFileToDocument
+    from haystack.components.joiners import DocumentJoiner
+    from haystack.components.routers.file_type_router import FileTypeRouter
+
+    p = _validate_params("parsing", "auto", _AutoParsingParams, raw)
+    return ParsingGraph(
+        components={
+            # Windows 的 mimetypes 不認得 .md → 必須顯式註冊,
+            # 否則 .md 全部落進 unclassified、靜默消失。
+            "router": FileTypeRouter(
+                mime_types=["text/plain", "text/markdown", "application/pdf"],
+                additional_mimetypes={"text/markdown": ".md"},
+            ),
+            "text": TextFileToDocument(encoding=p.encoding),
+            "markdown": TextFileToDocument(encoding=p.encoding),
+            "pdf": PdfToDocument(mode=p.ocr, ocr_scale=p.ocr_scale),
+            # sort_by_score=False:parsing 階段全是 score=None,保持到達
+            # 順序(文件內順序是 seq 穩定性的依據)且不觸發 joiner 警告。
+            "join": DocumentJoiner(join_mode="concatenate", sort_by_score=False),
+        },
+        connections=[
+            ("router.text/plain", "text.sources"),
+            ("router.text/markdown", "markdown.sources"),
+            ("router.application/pdf", "pdf.sources"),
+            ("text.documents", "join.documents"),
+            ("markdown.documents", "join.documents"),
+            ("pdf.documents", "join.documents"),
+        ],
+        sources_target=("router", "sources"),
+        meta_target=("router", "meta"),
+        output="join",
     )
 
 
@@ -326,7 +463,15 @@ def _build_sentence_transformers(
     )
 
 
-class _InMemoryParams(BaseParams):
+class _IndexingCommonParams(BaseParams):
+    incremental: bool = Field(
+        default=False,
+        description="增量 ingest:內容未變的切片跳過 embedding 與寫入"
+        "(需要索引具備 incremental_update 能力)",
+    )
+
+
+class _InMemoryParams(_IndexingCommonParams):
     pass
 
 
@@ -343,7 +488,7 @@ def _build_in_memory_store(raw: dict[str, Any], ctx: BuildContext) -> Any:
     )
 
 
-class _ElasticsearchParams(BaseParams):
+class _ElasticsearchParams(_IndexingCommonParams):
     hosts: str | list[str] = Field(description="ES 端點,如 http://localhost:9200")
     index: str = Field(default="modular-rag", description="索引名稱")
     api_key: str | None = Field(default=None, description="API key(選填)")
@@ -370,13 +515,11 @@ def _build_elasticsearch_store(raw: dict[str, Any], ctx: BuildContext) -> Any:
 
 
 IMPORT_FACTORIES: dict[str, SlotFactory] = {
+    # 萬用 importer:txt / md / pdf 都收(可用 extensions 收窄);
+    # content_type 依 extensions 推導,混合型別時 parsing 需用 auto 分流。
     "local_file": SlotFactory(
-        build=_make_file_lister_builder("local_file", [".txt", ".md"]),
-        output_content_type="text",
-    ),
-    "pdf_file": SlotFactory(
-        build=_make_file_lister_builder("pdf_file", [".pdf"]),
-        output_content_type="pdf",
+        build=_make_file_lister_builder("local_file", _LOCAL_FILE_DEFAULT_EXTENSIONS),
+        output_content_type_fn=_local_file_output_type,
     ),
 }
 
@@ -390,6 +533,14 @@ PARSING_FACTORIES: dict[str, SlotFactory] = {
         build=_build_pdf,
         kind="converter",
         input_content_types=frozenset({"pdf"}),
+        produces_pages=True,
+    ),
+    # 依檔案類型分流(混合 KB)。produces_pages=True:pdf 分支產生頁界;
+    # txt/md 在 page_based 下視為單頁(與「非分頁來源 page=1」語意一致)。
+    "auto": SlotFactory(
+        build=_build_auto,
+        kind="converter",
+        input_content_types=frozenset({"text", "pdf", "mixed"}),
         produces_pages=True,
     ),
     "clean": SlotFactory(build=_build_clean, kind="doc_processor"),
@@ -409,9 +560,13 @@ EMBEDDING_FACTORIES: dict[str, SlotFactory] = {
 }
 
 INDEXING_FACTORIES: dict[str, SlotFactory] = {
+    # in_memory 也宣告 incremental_update:store 生命週期內按 id 查找 /
+    # upsert 都支援(僅不跨重啟,但那是持久性問題,不是能力問題)。
     "in_memory": SlotFactory(
         build=_build_in_memory_store,
-        capabilities=frozenset({"vector_search", "text_search", "metadata_filter"}),
+        capabilities=frozenset(
+            {"vector_search", "text_search", "metadata_filter", "incremental_update"}
+        ),
     ),
     "elasticsearch": SlotFactory(
         build=_build_elasticsearch_store,
@@ -481,13 +636,28 @@ def build_ingestion_pipeline(
         store = indexing_factory.build(ing.indexing.params_for(indexing_method), ctx)
     ctx.store = store
 
+    incremental = bool(
+        ing.indexing.params_for(indexing_method).get("incremental", False)
+    )
+    if incremental and "incremental_update" not in indexing_factory.capabilities:
+        raise IncompatiblePipelineError(
+            f"indexing 方法 '{indexing_method}' 未宣告 incremental_update 能力,"
+            "無法使用 incremental: true(增量 ingest 需要按 id 查找既有切片)"
+        )
+
     import_method = _require_single("import", ing.import_)
     import_factory = _resolve("import", IMPORT_FACTORIES, import_method)
-    lister = import_factory.build(ing.import_.params_for(import_method), ctx)
+    import_params = ing.import_.params_for(import_method)
+    lister = import_factory.build(import_params, ctx)  # 參數先過 pydantic 驗證
+    output_content_type = (
+        import_factory.output_content_type_fn(import_params)
+        if import_factory.output_content_type_fn is not None
+        else import_factory.output_content_type
+    )
 
     parse_methods, parse_factories = _build_parsing_chain(ing.parsing)
     validate_ingestion_compatibility(
-        import_method, import_factory, parse_methods[0], parse_factories[0],
+        import_method, output_content_type, parse_methods[0], parse_factories[0],
         PARSING_FACTORIES,
     )
     chain_produces_pages = any(f.produces_pages for f in parse_factories)
@@ -508,26 +678,78 @@ def build_ingestion_pipeline(
 
     pipeline = Pipeline()
     pipeline.add_component("importer", lister)
-    parser_names: list[str] = []
-    for position, (method, factory) in enumerate(zip(parse_methods, parse_factories)):
-        name = "parser" if position == 0 else f"parser_{position + 1}"
-        parser_names.append(name)
-        pipeline.add_component(
-            name, factory.build(ing.parsing.params_for(method), ctx)
+
+    # 檔案層增量:importer 之後就過濾,未變更的檔案連 parse(含 OCR)
+    # 都不會發生。manifest 由 RagPipelines.run_ingestion 在成功後持久化。
+    if incremental:
+        from rag import kb_meta
+
+        index_name = ing.indexing.params_for(indexing_method).get("index")
+        config_key = kb_meta.parse_config_key(
+            config.ingestion.model_dump(by_alias=True)
         )
+        pipeline.add_component(
+            "source_filter",
+            SourceChangeFilter(
+                read_previous=lambda: kb_meta.read_manifest(
+                    indexing_method, store, index_name
+                ),
+                config_key=config_key,
+            ),
+        )
+        pipeline.connect("importer.sources", "source_filter.sources")
+        pipeline.connect("importer.meta", "source_filter.meta")
+        sources_from, meta_from = "source_filter.sources", "source_filter.meta"
+    else:
+        sources_from, meta_from = "importer.sources", "importer.meta"
+
+    # 鏈首 converter:單一元件,或展開為內部圖(auto 的 router + 分支)。
+    head = parse_factories[0].build(ing.parsing.params_for(parse_methods[0]), ctx)
+    if isinstance(head, ParsingGraph):
+        def _abs(rel: str) -> str:
+            return f"parser_{rel}"  # parser_router / parser_text / …
+
+        for rel, comp in head.components.items():
+            pipeline.add_component(_abs(rel), comp)
+        for sender, receiver in head.connections:
+            s_comp, s_sock = sender.split(".", 1)
+            r_comp, r_sock = receiver.split(".", 1)
+            pipeline.connect(f"{_abs(s_comp)}.{s_sock}", f"{_abs(r_comp)}.{r_sock}")
+        pipeline.connect(
+            sources_from, f"{_abs(head.sources_target[0])}.{head.sources_target[1]}"
+        )
+        pipeline.connect(
+            meta_from, f"{_abs(head.meta_target[0])}.{head.meta_target[1]}"
+        )
+        docs_chain = [_abs(head.output)]
+    else:
+        pipeline.add_component("parser", head)
+        pipeline.connect(sources_from, "parser.sources")
+        pipeline.connect(meta_from, "parser.meta")
+        docs_chain = ["parser"]
+
+    # 鏈尾 doc_processor(clean 等):照舊命名 parser_2、parser_3…
+    for position, (method, factory) in enumerate(
+        zip(parse_methods[1:], parse_factories[1:]), start=2
+    ):
+        name = f"parser_{position}"
+        pipeline.add_component(name, factory.build(ing.parsing.params_for(method), ctx))
+        docs_chain.append(name)
+
     pipeline.add_component("stamper", ChunkMetaStamper())
     pipeline.add_component("embedder", doc_embedder)
     pipeline.add_component(
         "writer", DocumentWriter(store, policy=DuplicatePolicy.OVERWRITE)
     )
-
-    pipeline.connect("importer.sources", f"{parser_names[0]}.sources")
-    pipeline.connect("importer.meta", f"{parser_names[0]}.meta")
-    docs_chain = list(parser_names)
     if splitter is not None:
         pipeline.add_component("chunker", splitter)
         docs_chain.append("chunker")
-    docs_chain += ["stamper", "embedder", "writer"]
+    docs_chain.append("stamper")
+    if incremental:
+        # 蓋章後、embedding 前:內容未變的切片在這裡被擋下,省掉 embedding
+        pipeline.add_component("change_filter", IncrementalChangeFilter(store))
+        docs_chain.append("change_filter")
+    docs_chain += ["embedder", "writer"]
     for upstream, downstream in zip(docs_chain, docs_chain[1:]):
         pipeline.connect(f"{upstream}.documents", f"{downstream}.documents")
     return pipeline, store
@@ -1152,7 +1374,11 @@ def build_inference_pipeline(
         if glossary_name is not None:
             outer.connect(f"{glossary_name}.notes", "prompt_builder.glossary_notes")
         outer.connect("prompt_builder.prompt", "generator.messages")
-    return outer, {"query_entry": query_entry, "generate_answer": inf.generate_answer}
+    return outer, {
+        "query_entry": query_entry,
+        "generate_answer": inf.generate_answer,
+        "transform_names": transform_names,
+    }
 
 
 def _load_native_pipeline(path: str) -> Pipeline:
@@ -1178,10 +1404,77 @@ class RagPipelines:
     store: Any
     query_entry: tuple[str, str] | None = None
     generate_answer: bool = True
+    transform_names: list[str] = dc_field(default_factory=list)
 
     def run_ingestion(self) -> dict[str, Any]:
-        """執行 ingestion(來源資訊已在 config 中)。"""
-        return self.ingestion.run({})
+        """執行 ingestion(來源資訊已在 config 中)。
+
+        Returns:
+            dict:各元件的輸出(``importer`` / ``parser`` / ``chunker`` /
+            ``stamper`` / ``embedder`` / ``writer`` …),外加 ``trace``
+            —— 依執行順序列出每一步的元件名稱、類別與產出筆數,
+            供 CLI 或稽核時逐步檢視。
+        """
+        step_names = step_order(self.ingestion)
+        result = self.ingestion.run({}, include_outputs_from=set(step_names))
+
+        # 檔案層增量:成功跑完才持久化 manifest(失敗不會誤記「已處理」)
+        source_output = result.get("source_filter") or {}
+        manifest = source_output.get("manifest")
+        if manifest is not None and self.config is not None:
+            from rag import kb_meta
+
+            method, index_name = kb_meta.indexing_info(self.config)
+            kb_meta.write_manifest(method, self.store, manifest, index_name)
+
+        # 顯式回報沒有產出任何切片的來源檔案(掃描檔沒 OCR、空檔、
+        # 解析失敗被跳過…)—— 靜默消失的檔案是最難查的問題。
+        listed = [
+            entry.get("doc_id")
+            for entry in (result.get("importer") or {}).get("meta") or []
+        ]
+        skipped_files = set(source_output.get("skipped_files") or [])
+        stamped = {
+            doc.meta.get("doc_id")
+            for doc in (result.get("stamper") or {}).get("documents") or []
+        }
+        empty_sources = [
+            doc_id
+            for doc_id in listed
+            if doc_id and doc_id not in stamped and doc_id not in skipped_files
+        ]
+        result["empty_sources"] = empty_sources
+        if empty_sources:
+            logger.warning(
+                "以下來源檔案沒有產出任何切片(掃描檔需要 OCR?空檔?"
+                "解析失敗?詳見上方紀錄):%s", ", ".join(empty_sources),
+            )
+
+        trace = []
+        for name in step_names:
+            output = result.get(name) or {}
+            # 防禦:router 有來源落進未接線的 socket = 檔案被靜默丟棄。
+            # 理論上不會發生(FileLister 已按副檔名預過濾),發生就要出聲。
+            for key in ("unclassified", "failed"):
+                leftover = output.get(key)
+                if leftover:
+                    logger.warning(
+                        "元件 '%s' 有 %d 個來源進入 '%s'(未被任何分支處理):%s",
+                        name, len(leftover), key, [str(item)[:80] for item in leftover[:5]],
+                    )
+            payload = next(
+                (output[key] for key in ("documents", "sources") if key in output), None
+            )
+            trace.append(
+                {
+                    "component": name,
+                    "type": type(self.ingestion.get_component(name)).__name__,
+                    "count": len(payload) if payload is not None else None,
+                    "output": output,
+                }
+            )
+        result["trace"] = trace
+        return result
 
     def query(self, text: str) -> dict[str, Any]:
         """執行單次查詢,回傳答案與可稽核的中間結果。
@@ -1190,9 +1483,19 @@ class RagPipelines:
             dict:``answer``(回答文字)、``documents``(融合後切片)、
             ``subquery_results``(各子查詢重排後結果)、``prompt``
             (實際送出的 prompt,可稽核)、``reply_meta``(模型 /
-            finish_reason / usage 等)。檢索-only 模式
-            (``generate_answer: false``)key 不變,但 ``answer`` /
-            ``prompt`` / ``reply_meta`` 為 ``None``。
+            finish_reason / usage 等)、``trace``(逐步紀錄,見下)。
+            檢索-only 模式(``generate_answer: false``)key 不變,
+            但 ``answer`` / ``prompt`` / ``reply_meta`` 為 ``None``。
+
+            ``trace`` 的形狀::
+
+                {
+                  "query": 原始查詢,
+                  "transforms": [{component, type, queries}],   # 每段改寫後的查詢
+                  "subqueries": [{query, steps: [{component, type, documents}]}],
+                  "fusion": {documents},                        # 融合 / 去重後
+                  "generation": {prompt, answer, meta} | None,
+                }
 
         Raises:
             ConfigError: inference 由原生 Haystack YAML 載入
@@ -1206,10 +1509,11 @@ class RagPipelines:
             )
         entry_component, entry_socket = self.query_entry
         data: dict[str, Any] = {entry_component: {entry_socket: [text]}}
-        include = {"fusion", "multi_query"}
+        # 全元件輸出:transform 鏈的每段改寫、內部檢索 / 重排的每步結果
+        # 都要留下紀錄,查詢過程才是可稽核的而非黑箱。
+        include = set(self.inference.graph.nodes)
         if self.generate_answer:
             data["prompt_builder"] = {"query": text}
-            include.add("prompt_builder")
         result = self.inference.run(data, include_outputs_from=include)
         answer = prompt_text = reply_meta = None
         if self.generate_answer:
@@ -1220,12 +1524,35 @@ class RagPipelines:
             )
             answer = reply.text
             reply_meta = dict(reply.meta or {})
+        transforms = [
+            {
+                "component": name,
+                "type": type(self.inference.get_component(name)).__name__,
+                "queries": list((result.get(name) or {}).get("queries", [])),
+            }
+            for name in self.transform_names
+        ]
         return {
             "answer": answer,
             "documents": result["fusion"]["documents"],
             "subquery_results": result["multi_query"]["results"],
             "prompt": prompt_text,
             "reply_meta": reply_meta,
+            "trace": {
+                "query": text,
+                "transforms": transforms,
+                "subqueries": result["multi_query"].get("traces", []),
+                "fusion": {
+                    "documents": result["fusion"]["documents"],
+                    # False = 元件只是穿透(單一查詢且 config 未設 fusion)
+                    "applied": result["fusion"].get("applied", False),
+                },
+                "generation": (
+                    {"prompt": prompt_text, "answer": answer, "meta": reply_meta}
+                    if self.generate_answer
+                    else None
+                ),
+            },
         }
 
 
@@ -1247,12 +1574,14 @@ def build_pipelines(config: RAGConfig, *, store: Any = None) -> RagPipelines:
 
     query_entry: tuple[str, str] | None = None
     generate_answer = True
+    transform_names: list[str] = []
     if native is not None and native.inference is not None:
         inference_pipeline = _load_native_pipeline(native.inference)
     else:
         inference_pipeline, meta = build_inference_pipeline(config, store=store)
         query_entry = meta["query_entry"]
         generate_answer = meta["generate_answer"]
+        transform_names = meta["transform_names"]
     return RagPipelines(
         config=config,
         ingestion=ingestion_pipeline,
@@ -1260,4 +1589,5 @@ def build_pipelines(config: RAGConfig, *, store: Any = None) -> RagPipelines:
         store=store,
         query_entry=query_entry,
         generate_answer=generate_answer,
+        transform_names=transform_names,
     )

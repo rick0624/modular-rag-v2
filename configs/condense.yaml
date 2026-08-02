@@ -15,16 +15,22 @@
 #   docker compose up -d          # 或指向既有的 ES 叢集
 #   python scripts/run_demo.py --config configs/condense.yaml
 #
-# 需要的環境變數:ES_URL、COMPANY_EMBEDDING_API_KEY、COMPANY_LLM_API_KEY
+# 連線設定與 configs/home.yaml 一致:OpenAI embeddings + 本機 ES + OpenAI 生成。
+# 需要的環境變數:OPENAI_API_KEY
+#
+# 注意:未啟用的示範區塊使用「字面值占位符」(如 YOUR_TOKEN),不用
+# ${ENV_VAR} —— 因為 ${} 會在載入時立刻展開,引用未設定的變數即使在
+# 未使用的區塊也會報錯。
 
 ingestion:
   import:
     method: local_file
     params:
       input_dir: ./data/raw
+      extensions: [".txt", ".md"]   # 釘住純文字:parsing 用 plain_text 才合法
 
   parsing:
-    method: plain_text              # PDF 來源改:import 換 pdf_file、這裡換 pdf
+    method: plain_text              # 含 PDF 的語料改:extensions 放開、這裡換 auto
 
   chunking:
     method: fixed_size
@@ -33,13 +39,13 @@ ingestion:
       split_overlap: 50
 
   embedding:
-    method: api_embedding           # 公司 embedding API(OpenAI 式回應)
+    method: api_embedding           # OpenAI embeddings API(OpenAI 式回應)
     method_params:
       api_embedding:
-        endpoint: https://your-company-api.example.com/v1/embeddings
+        endpoint: https://api.openai.com/v1/embeddings
         headers:
-          Authorization: Bearer ${COMPANY_EMBEDDING_API_KEY}
-        model: your-embedding-model # 閘道不接受 model 欄位時,刪掉此行即可
+          Authorization: Bearer ${OPENAI_API_KEY}
+        model: text-embedding-3-small
         batch_size: 16
         embeddings_field: data      # {"data": [{"embedding": [...]}]} 形狀
         item_field: embedding
@@ -47,8 +53,10 @@ ingestion:
   indexing:
     method: elasticsearch           # 向量 + BM25 + filter 都在 ES 伺服器端
     params:
-      hosts: ${ES_URL}
-      index: modular-rag-condense
+      hosts: http://localhost:9200
+      # 與 configs/home.yaml 同一個索引:embedding 模型相同(dims 一致)、
+      # 切塊設定也相同,可直接沿用已 ingest 的資料,不必重跑 ingestion。
+      index: modular-rag-openai-small
 
 inference:
   query_transformation:
@@ -70,20 +78,23 @@ inference:
     method: [similarity, llm_fact_check]
     method_params:
       similarity:                   # cross-encoder 收斂 30 → 10(top n)
-        model: cross-encoder/ms-marco-MiniLM-L-6-v2
+        # 多語模型(含中文)。英文的 ms-marco-MiniLM 對中文毫無鑑別力,
+        # 中文語料會排出隨機順序。
+        model: cross-encoder/mmarco-mMiniLMv2-L12-H384-v1
         top_k: 10
       llm_fact_check: {}
         # 未指定 generator:沿用 generation 槽位;只過濾不相關切片,
         # 不重排、不改分。max_docs 可限制送查核的切片數。
 
   generation:                       # 僅作為上方 LLM 方法的沿用連線來源
-    method: gateway_openai_compatible
+    method: openai
     method_params:
-      gateway_openai_compatible:
-        base_url: https://your-company-llm.example.com/v1
-        api_key: ${COMPANY_LLM_API_KEY}
-        # model 刻意不設定:公司閘道不接受 model 欄位,請求將不帶該欄位
-        temperature: 0.2
+      openai:                       # 官方 OpenAI;api_key 取自 OPENAI_API_KEY
+        model: gpt-5-nano
+      gateway_openai_compatible:    # 改走公司閘道時切 method 即可
+        base_url: https://llm.example.com/v1
+        api_key: YOUR_TOKEN         # 未啟用區塊用字面值占位符,見下方註記
+        # model 刻意不設定:閘道不接受 model 欄位時,請求將不帶該欄位
       mock: {}                      # 離線試跑備援(切 method 即換)
 
   generate_answer: false            # 檢索-only:不做答案生成

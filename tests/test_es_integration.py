@@ -29,7 +29,7 @@ def es_config_dict(corpus_dir):
     index = f"modular-rag-test-{uuid.uuid4().hex[:8]}"
     return make_config(
         ingestion={
-            "import": {"method": "local_file", "params": {"input_dir": str(corpus_dir)}},
+            "import": {"method": "local_file", "params": {"input_dir": str(corpus_dir), "extensions": [".txt"]}},
             "indexing": {
                 "method": "elasticsearch",
                 "params": {"hosts": ES_URL, "index": index},
@@ -70,6 +70,70 @@ def test_es_ingest_query_and_upsert(es_config_dict):
         pipeline2.run({})
         pipelines.store.client.indices.refresh(index=index_name)
         assert pipelines.store.count_documents() == first_count
+    finally:
+        _cleanup(pipelines.store, index_name)
+
+
+def test_es_fingerprint_roundtrip(es_config_dict):
+    """指紋寫進 ES index mapping 的 _meta,跨 store 實例讀得回來。"""
+    from rag.kb_meta import ingestion_fingerprint, read_fingerprint, write_fingerprint
+
+    config = parse_config(es_config_dict)
+    index_name = config.ingestion.indexing.params_for("elasticsearch")["index"]
+    pipelines = build_pipelines(config)
+    try:
+        pipelines.run_ingestion()  # 索引建立後才能寫 mapping
+        fingerprint = ingestion_fingerprint(es_config_dict)
+        write_fingerprint("elasticsearch", pipelines.store, fingerprint, index_name)
+        assert (
+            read_fingerprint("elasticsearch", pipelines.store, index_name)
+            == fingerprint
+        )
+        # 全新 store 實例(模擬服務重啟)也讀得到:指紋跟著索引走
+        fresh = build_pipelines(config)
+        assert (
+            read_fingerprint("elasticsearch", fresh.store, index_name) == fingerprint
+        )
+    finally:
+        _cleanup(pipelines.store, index_name)
+
+
+def test_es_fingerprint_missing_index_returns_none(es_config_dict):
+    from rag.kb_meta import read_fingerprint
+
+    config = parse_config(es_config_dict)
+    pipelines = build_pipelines(config)
+    index_name = config.ingestion.indexing.params_for("elasticsearch")["index"]
+    try:
+        assert (
+            read_fingerprint("elasticsearch", pipelines.store, "no-such-index-xyz")
+            is None
+        )
+    finally:
+        _cleanup(pipelines.store, index_name)
+
+
+def test_es_incremental_ingest_skips_unchanged(es_config_dict, corpus_dir):
+    es_config_dict["ingestion"]["indexing"]["params"]["incremental"] = True
+    config = parse_config(es_config_dict)
+    index_name = config.ingestion.indexing.params_for("elasticsearch")["index"]
+    pipelines = build_pipelines(config)
+    try:
+        first = pipelines.run_ingestion()
+        first_written = first["writer"]["documents_written"]
+        assert first_written > 0
+        pipelines.store.client.indices.refresh(index=index_name)
+
+        # 第二次:內容沒變,change_filter 全部跳過,不重算 embedding
+        second = pipelines.run_ingestion()
+        assert second["writer"]["documents_written"] == 0
+        assert second["change_filter"]["skipped"] == first_written
+
+        # 新增檔案:只有新檔的切片通過
+        (corpus_dir / "extra.txt").write_text("增量測試新檔。", encoding="utf-8")
+        third = pipelines.run_ingestion()
+        passed = third["change_filter"]["documents"]
+        assert {d.meta["doc_id"] for d in passed} == {"extra.txt"}
     finally:
         _cleanup(pipelines.store, index_name)
 

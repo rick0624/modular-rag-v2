@@ -15,7 +15,10 @@ def test_pdf_import_with_plain_text_parser_rejected():
     config = parse_config(
         make_config(
             ingestion={
-                "import": {"method": "pdf_file", "params": {"input_dir": "./x"}},
+                "import": {
+                    "method": "local_file",
+                    "params": {"input_dir": "./x", "extensions": [".pdf"]},
+                },
                 "parsing": {"method": "plain_text"},
             }
         )
@@ -23,9 +26,9 @@ def test_pdf_import_with_plain_text_parser_rejected():
     with pytest.raises(IncompatiblePipelineError) as excinfo:
         build_ingestion_pipeline(config)
     message = str(excinfo.value)
-    assert "import 方法 'pdf_file' 輸出 content_type {'pdf'}" in message
+    assert "import 方法 'local_file' 輸出 content_type {'pdf'}" in message
     assert "只支援 {'text'}" in message
-    assert "可相容的 parsing 方法:'pdf'" in message
+    assert "'auto'" in message and "'pdf'" in message  # 相容選項含分流與純 pdf
 
 
 def test_page_based_requires_paginating_parser():
@@ -36,7 +39,7 @@ def test_page_based_requires_paginating_parser():
         build_ingestion_pipeline(config)
     message = str(excinfo.value)
     assert "chunking 方法 'page_based' 需要分頁輸入" in message
-    assert "會產生分頁的 parsing 方法:'pdf'" in message
+    assert "會產生分頁的 parsing 方法:'auto', 'pdf'" in message
     assert "'fixed_size'" in message  # 列出不需分頁的替代 chunking 方法
 
 
@@ -45,7 +48,10 @@ def test_paginating_chain_link_satisfies_page_requirement(pdf_dir):
     config = parse_config(
         make_config(
             ingestion={
-                "import": {"method": "pdf_file", "params": {"input_dir": str(pdf_dir)}},
+                "import": {
+                    "method": "local_file",
+                    "params": {"input_dir": str(pdf_dir), "extensions": [".pdf"]},
+                },
                 "parsing": {"method": ["pdf", "clean"], "method_params": {}},
                 "chunking": {"method": "page_based"},
             }

@@ -1,4 +1,4 @@
-# 預設配置,同時是「方法型錄」:每個槽位可用的方法與參數都以
+# 預設配置,同時是「方法型錄」:每個槽位**所有**可用的方法與參數都以
 # method_params 區塊並存展示 —— 換方法只需改 method 那一行,其餘區塊
 # 原樣保留、互不干擾(只有被選中的區塊會做參數驗證)。
 #
@@ -7,134 +7,214 @@
 #
 #   python scripts/run_demo.py
 #
-# 注意:未啟用的示範區塊使用「字面值占位符」(如 YOUR_TOKEN),不用
-# ${ENV_VAR} —— 因為 ${} 會在載入時立刻展開,引用未設定的變數即使在
-# 未使用的區塊也會報錯。實際接入時改成 ${YOUR_ENV_VAR} 並於 .env 提供。
+# 註解慣例:
+#   - 每個參數後面標註「預設值」;沒寫的話就是該欄位的預設。
+#   - 被註解掉的參數 = 選填,取消註解即可覆寫預設。
+#   - 未啟用的示範區塊使用「字面值占位符」(如 YOUR_TOKEN),不用
+#     ${ENV_VAR} —— 因為 ${} 會在載入時立刻展開,引用未設定的變數即使
+#     在未使用的區塊也會報錯。實際接入時改成 ${YOUR_ENV_VAR} 並於 .env 提供。
 
 ingestion:
   import:
-    method: local_file              # 可選:local_file / pdf_file
+    method: local_file              # 唯一方法:萬用 importer(txt / md / pdf)
     method_params:
       local_file:
-        input_dir: ./data/raw
-        # extensions: [".txt", ".md"]
-      pdf_file:
-        input_dir: ./data/pdfs
+        input_dir: ./data/raw       # 必填:要匯入的資料夾
+        # extensions: [".txt", ".md", ".pdf"]   # 預設:三者全收
+        #   收窄成同質型別(全文字或全 PDF)後,才能搭配單型別 parser
+        #   (plain_text / pdf);混合型別只有 auto 能接。
+        # recursive: true           # 預設 true:含子資料夾
 
   parsing:
-    method: plain_text              # 可選:plain_text / pdf;鏈:[pdf, clean]
+    # 可選:auto / plain_text / pdf;鏈(輸出同型可串):[auto, clean]
+    method: auto
     method_params:
-      plain_text:
-        encoding: utf-8
-      pdf: {}
+      auto:                         # 依檔案類型分流:txt/md → 文字、pdf → PyPDF/OCR
+        encoding: utf-8             # 預設 utf-8:文字 / Markdown 檔編碼
+        # ocr: "auto"               # 預設 auto。off=純 pypdf;auto=掃描頁
+        #                           # (無文字層)才 OCR;force=全頁 OCR
+        #                           # (多欄/表格版面 pypdf 順序會亂時用)。
+        #                           # 需 pip install -e ".[ocr]"
+        #                           # 引號不可省:YAML 把裸寫的 off/on 當布林
+        # ocr_scale: 2.0            # 預設 2.0:OCR 前的頁面渲染倍率
+      plain_text:                   # 純文字(import extensions 需釘 .txt/.md)
+        encoding: utf-8             # 預設 utf-8
+      pdf:                          # 純 PDF(import extensions 需釘 .pdf)
+        # ocr: "auto"               # 預設 auto(同 auto 方法的 ocr)
+        # ocr_scale: 2.0            # 預設 2.0
       clean:                        # 只能接在 converter 之後(方法鏈)
-        remove_empty_lines: true
-        remove_extra_whitespaces: true
+        remove_empty_lines: true    # 預設 true
+        remove_extra_whitespaces: true  # 預設 true
+        # remove_repeated_substrings: false  # 預設 false:去除頁首頁尾重複段
 
   chunking:
-    method: fixed_size              # 可選:fixed_size / structure_based / page_based / no_chunking
+    # 可選:fixed_size / structure_based / page_based / no_chunking
+    method: fixed_size
     method_params:
       fixed_size:                   # 固定長度(字元),\f/段落/行邊界優先
-        split_length: 300
-        split_overlap: 50
+        split_length: 300           # 預設 512:每片字元數上限
+        split_overlap: 50           # 預設 64:相鄰切片重疊字元數(需 < split_length)
       structure_based:              # 依結構遞迴切分(頁 → 段 → 行 → 句)
-        split_length: 512
-      page_based:                   # 按頁切(需要會產生分頁的 parser,如 pdf)
-        pages_per_chunk: 1
-      no_chunking: {}
+        split_length: 512           # 預設 512
+        # split_overlap: 0          # 預設 0
+        # separators: ["\f", "\n\n", "\n", "。", " "]   # 預設值即此
+      page_based:                   # 按頁切(需要會產生分頁的 parser:pdf / auto)
+        pages_per_chunk: 1          # 預設 1
+      no_chunking: {}               # 整份文件一個切片(無參數)
 
   embedding:
-    method: mock                    # 可選:mock / sentence_transformers / api_embedding
+    # 可選:mock / sentence_transformers / api_embedding
+    # 注意:查詢端 embedder 由此槽位派生(同向量空間紀律),
+    #      換模型或維度後必須重建索引。
+    method: mock
     method_params:
       mock:                         # 離線確定性偽向量(開發測試用)
-        dim: 64
-      sentence_transformers:        # 需安裝:pip install -e ".[st]"
-        model_name: sentence-transformers/all-MiniLM-L6-v2
+        dim: 64                     # 預設 32
+      sentence_transformers:        # 本地模型;需 pip install -e ".[st]"
+        model_name: sentence-transformers/all-MiniLM-L6-v2   # 預設值即此
       api_embedding:                # 通用 HTTP API(回應形狀見 README 對映表)
-        endpoint: https://api.example.com/v1/embeddings
-        headers:
+        endpoint: https://api.openai.com/v1/embeddings   # 必填
+        headers:                    # 預設 {}
           Authorization: Bearer YOUR_TOKEN
-        model: your-embedding-model
-        embeddings_field: data      # OpenAI 式回應:data[].embedding
-        item_field: embedding
+        model: text-embedding-3-small   # 預設 None(不帶 model 欄位)
+        embeddings_field: data      # 預設 "embeddings";OpenAI 式為 data
+        item_field: embedding       # 預設 None;OpenAI 式為 embedding
+        # batch_size: 16            # 預設 16
+        # timeout: 30.0             # 預設 30.0
+        # texts_field: input        # 預設 "input":請求中放文字的欄位名
+        # model_field: model        # 預設 "model":請求中放模型的欄位名
 
   indexing:
     method: in_memory               # 可選:in_memory / elasticsearch
     method_params:
-      in_memory: {}
-      elasticsearch:                # 需安裝:pip install -e ".[es]"
-        hosts: http://localhost:9200
-        index: modular-rag
+      in_memory:
+        # incremental: false        # 預設 false。true = 增量 ingest(兩層):
+        #                           # 檔案沒變 → 連 parse(含 OCR)都跳過;
+        #                           # 切片內容沒變 → 跳過 embedding 與寫入。
+        #                           # 需索引具備 incremental_update 能力。
+      elasticsearch:                # 需 pip install -e ".[es]"
+        hosts: http://localhost:9200    # 必填
+        # 索引名帶上 embedding 模型:ES 的 dense_vector dims 建立後不可
+        # 變更,換模型/維度就得換索引(或先刪掉重建)。
+        index: modular-rag          # 預設 "modular-rag"
+        # api_key: YOUR_TOKEN       # 預設 None
+        # incremental: false        # 預設 false(同上)
 
 inference:
   query_transformation:
-    method: normalize               # 可選:passthrough / normalize / glossary / jargon_mapping / llm_rewrite / llm_decompose
-    method_params:                  # 鏈:[normalize, llm_decompose] 或 [jargon_mapping, llm_rewrite]
-      normalize:
-        lowercase: true
-      glossary:                     # 術語表:命中的定義注入 prompt(不改查詢)
-        glossary:
+    # 可選:passthrough / normalize / glossary / jargon_mapping /
+    #      llm_rewrite / llm_decompose
+    # 鏈(list[str] → list[str],可串接):[normalize, llm_decompose]
+    #                                 或 [jargon_mapping, llm_rewrite]
+    method: normalize
+    method_params:
+      passthrough: {}               # 原樣通過(無參數)
+      normalize:                    # NFKC 正規化、壓空白、去頭尾
+        lowercase: true             # 預設 true:拉丁字母轉小寫
+      glossary:                     # 術語表:命中的定義**注入 prompt**(不改查詢)
+        glossary:                   # 預設 None:行內術語表
           RRF: Reciprocal Rank Fusion,以名次融合多路檢索結果
-        # glossary_path: ./configs/glossary.yaml
-        # expand_query: false
-      jargon_mapping:               # 術語直白化:直接替換查詢中的術語
-        mapping:
-          RRF: 多路檢索名次融合
-        # json_path: ./configs/jargon.json
-      llm_rewrite: {}               # LLM 查詢改寫(1 → 1,更適合檢索的形式)
-        # generator 未設定時沿用 generation 槽位的 LLM
-        # prompt: 可覆寫預設改寫 prompt(含 {{ query }})
+        # glossary_path: ./configs/glossary.yaml   # 預設 None:YAML 檔
+        # expand_query: false       # 預設 false;true = 定義也附加到查詢文字
+      jargon_mapping:               # 術語**替換**查詢文字(適合檢索-only)
+        mapping:                    # 預設 None:行內對照表
+          kNN: 最近鄰向量搜尋
+        # json_path: ./configs/jargon.json   # 預設 None:扁平 JSON 檔
+      llm_rewrite:                  # LLM 查詢改寫(1 → 1)
+        # prompt: |                 # 預設:內建改寫 prompt(需含 {{ query }})
+        #   ...
+        # generator:                # 預設 None = 沿用 generation 槽位的 LLM
+        #   method: mock
+        #   params: {replies: ['{"rewritten_query": "...", "reason": "..."}']}
       llm_decompose:                # LLM 查詢拆解(1 → N 子查詢)
-        max_subqueries: 3
-        # generator 未設定時沿用 generation 槽位的 LLM
+        max_subqueries: 3           # 預設 4
+        # prompt: |                 # 預設:內建拆解 prompt(需含 {{ query }})
+        # generator: {...}          # 預設 None = 沿用 generation 槽位
 
   retrieval:
-    method: bm25                    # 可選:bm25 / embedding / hybrid
-    method_params:
+    method: hybrid                  # 可選:bm25 / embedding / hybrid
+    method_params:                  # 三者參數相同
       bm25:
-        top_k: 5
+        top_k: 5                    # 預設 10
+        # boost_k_factor: 1         # 預設 1;>1 時取回 top_k × factor 筆候選,
+        #                           # 供下游 rerank 收斂(檢索品質常見手段)
       embedding:
         top_k: 5
+        # boost_k_factor: 1
       hybrid:                       # BM25 + 向量,RRF 融合
         top_k: 5
-        # boost_k_factor: 3         # 候選放大:各 retriever 取 top_k × 3 供 rerank 收斂
+        # boost_k_factor: 1
 
   reranking:
-    method: none                    # 可選:none / similarity / llm / llm_fact_check;鏈:[similarity, llm_fact_check]
+    # 可選:none / similarity / llm / llm_fact_check
+    # 鏈(可串接):[similarity, llm] 或 [similarity, llm_fact_check]
+    method: none
     method_params:
-      none: {}
-      similarity:                   # cross-encoder(需 ".[st]")
-        model: cross-encoder/ms-marco-MiniLM-L-6-v2
-        top_k: 10
+      none: {}                      # 不重排(無參數)
+      similarity:                   # cross-encoder;需 pip install -e ".[st]"
+        # 中文語料請用多語模型;英文的 ms-marco-MiniLM 對中文毫無鑑別力
+        model: cross-encoder/mmarco-mMiniLMv2-L12-H384-v1   # 預設為英文 ms-marco
+        top_k: 10                   # 預設 10
       llm:                          # LLM listwise 重排
-        top_k: 5
-        # generator 未設定時沿用 generation 槽位的 LLM
-      llm_fact_check: {}            # LLM 事實查核:移除與查詢不相關的切片(只過濾)
-        # generator 未設定時沿用 generation 槽位的 LLM
-        # max_docs: 10              # 送查核的切片數上限,其餘原樣通過
+        top_k: 5                    # 預設 5
+        # generator: {...}          # 預設 None = 沿用 generation 槽位
+      llm_fact_check:               # LLM 相關性查核:**只過濾**,不重排不改分
+        # prompt: |                 # 預設:內建查核 prompt
+        #                           # (需含 {{ query }} 與 {{ documents }})
+        # max_docs: null            # 預設 None = 全部送查;設數字則其餘原樣通過
+        # generator: {...}          # 預設 None = 沿用 generation 槽位
 
   generation:
-    method: mock                    # 可選:mock / openai / gateway_openai_compatible
+    # 可選:mock / openai / gateway_openai_compatible
+    # generate_answer: false 時本槽位可省略,但保留可作為上方 LLM 方法的
+    # 沿用連線來源(llm_rewrite / llm_decompose / llm / llm_fact_check)。
+    method: mock
     method_params:
-      mock: {}
+      mock:                         # 離線假答案
+        # replies: ["固定回覆"]     # 預設 None;設定後依序循環
+        # prompt_template: |        # 預設 None = 內建模板
+        # system_prompt: ...        # 預設 None
       openai:                       # 官方 OpenAI(或相容 base_url)
-        model: gpt-5-mini
-        # api_key 未設定時使用 OPENAI_API_KEY 環境變數
-        # api_base_url: http://localhost:11434/v1   # Ollama 等
+        model: gpt-5-nano           # 預設 gpt-5-mini
+        # api_key: YOUR_TOKEN       # 預設 None = 用 OPENAI_API_KEY 環境變數
+        # api_base_url: http://localhost:11434/v1   # 預設 None(Ollama 等)
+        # temperature: 0.2          # 預設 None(不帶此欄位)
+        #                           # 注意:gpt-5 系列不接受非預設 temperature
+        # max_tokens: 1024          # 預設 None
+        # timeout: 60               # 預設 None
+        # prompt_template: |        # 預設 None = 內建模板
+        # system_prompt: 只根據提供的內容回答問題。   # 預設 None
       gateway_openai_compatible:    # 公司內部閘道(可不帶 model 欄位)
-        base_url: https://llm.example.com/v1
-        api_key: YOUR_TOKEN
-        system_prompt: 只根據提供的內容回答問題。
+        base_url: https://llm.example.com/v1    # 必填
+        api_key: YOUR_TOKEN         # 預設 None
+        system_prompt: 只根據提供的內容回答問題。   # 預設 None
+        # model: your-model         # 預設 None = 請求不帶 model 欄位
+        # temperature: 0.2          # 預設 None
+        # max_tokens: 1024          # 預設 None
+        # timeout: 60.0             # 預設 60.0
+        # headers: {X-Tenant: team-a}   # 預設 {}:額外的 HTTP 標頭
+        # completions_path: /chat/completions   # 預設值即此
+        # prompt_template: |        # 預設 None = 內建模板
 
-  # generate_answer: false          # 檢索-only:不做生成,query() 回傳檢索文件
-  #                                 # (generation 區塊仍可保留,作為 LLM 方法沿用來源)
+  # generate_answer: true           # 預設 true;false = 檢索-only
+  #                                 # (止於 fusion,不做生成;
+  #                                 #  answer / prompt / reply_meta 為 None)
 
-  # fusion:                         # 選填:多子查詢融合 / doc、page 聚合;
-  #   group_by: doc                 # none / doc / page   設定後單查詢也會去重排序
-  #   strategy: rrf                 # rrf / concat_dedup / max_score
-  #   top_k: 5
+  # fusion:                         # 選填:多子查詢融合 / doc、page 聚合
+  #                                 # 省略時:單一查詢原樣通過;多子查詢才融合
+  #   group_by: doc                 # 預設 none;可選 none / doc / page
+  #   strategy: rrf                 # 預設 rrf;可選 rrf / concat_dedup / max_score
+  #   top_k: 5                      # 預設 5
 
 evaluation:                         # 選填;省略則 demo 跳過評估
-  method: basic_retrieval_metrics
+  method: basic_retrieval_metrics   # 目前唯一方法(hit_rate / MRR)
   params:
     dataset_path: ./data/eval/qa.jsonl
+    # cases:                        # 或直接行內給案例(與 dataset_path 擇一)
+    #   - {query: "...", relevant_doc_ids: ["faiss.txt"]}
+
+# haystack_pipelines:               # 選填 escape hatch:某階段改用原生
+#                                   # Haystack pipeline YAML,跳過槽位組裝與
+#                                   # 相容性檢查(該階段的槽位區塊必須省略)
+#   ingestion: ./pipelines/native_ingestion.yaml
+#   inference: ./pipelines/native_inference.yaml

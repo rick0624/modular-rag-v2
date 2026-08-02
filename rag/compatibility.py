@@ -34,18 +34,20 @@ def _list_names(names: list[str]) -> str:
 
 def validate_ingestion_compatibility(
     import_method: str,
-    importer: Any,
+    output_type: str | None,
     parsing_method: str,
     parser_head: Any,
     parsing_table: Mapping[str, Any],
 ) -> None:
     """檢查 import 方法輸出的 content_type 是否能被 parsing 鏈的第一個方法處理。
 
+    ``output_type`` 由呼叫端提供:factory 的靜態宣告,或動態推導
+    (``output_content_type_fn``,如 local_file 依 extensions 推導)。
+
     Raises:
         IncompatiblePipelineError: parser 不支援 importer 的輸出型別;
             訊息列出可處理該型別的 parsing 方法。
     """
-    output_type = importer.output_content_type
     if output_type is None or output_type in parser_head.input_content_types:
         return
     compatible = [

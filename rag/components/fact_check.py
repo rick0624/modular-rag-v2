@@ -56,8 +56,10 @@ class LLMFactChecker:
             "{{ documents }}", rendered
         )
         try:
+            logger.debug("事實查核 prompt:\n%s", prompt)
             result = self.chat_generator.run(messages=[ChatMessage.from_user(prompt)])
             reply_text = result["replies"][0].text or ""
+            logger.debug("事實查核回覆:%s", reply_text)
         except Exception as exc:  # fail-soft:LLM 故障不可中斷查詢路徑
             logger.warning(
                 "事實查核失敗(%s: %s),保留全部切片", type(exc).__name__, exc
@@ -90,4 +92,14 @@ class LLMFactChecker:
         if not survivors:
             logger.info("事實查核判定所有受檢切片皆與查詢無關")
         kept = [checked[i] for i in survivors]
+        dropped = [
+            doc.meta.get("chunk_id") or doc.id
+            for i, doc in enumerate(checked)
+            if i not in set(survivors)
+        ]
+        if dropped:
+            logger.info(
+                "事實查核移除 %d/%d 筆(判定不相關):%s",
+                len(dropped), len(checked), ", ".join(str(item) for item in dropped),
+            )
         return {"documents": kept + passthrough}

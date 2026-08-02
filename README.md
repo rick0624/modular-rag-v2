@@ -21,11 +21,11 @@ Evaluation: JSONL 測試集 → 逐題查詢 → hit rate / MRR
 
 | 槽位 | 方法(粗體為預設) | 對應實作 |
 |---|---|---|
-| import | **local_file** / pdf_file | 自訂 FileLister(相對路徑 doc_id) |
-| parsing | **plain_text** / pdf / clean(鏈用) | Haystack converters + DocumentCleaner |
+| import | **local_file**(萬用:txt/md/pdf,`extensions` 可收窄) | 自訂 FileLister(相對路徑 doc_id) |
+| parsing | **auto**(依檔案類型分流) / plain_text / pdf / clean(鏈用);pdf 支援 `ocr: off/auto/force` | FileTypeRouter + 自訂 PdfToDocument(pypdf + rapidocr)+ DocumentCleaner |
 | chunking | **fixed_size** / structure_based / page_based / no_chunking | (Recursive)DocumentSplitter,一律字元單位 |
 | embedding | **mock** / sentence_transformers / api_embedding | ST 整合套件 / 自訂 Flexible API embedder |
-| indexing | **in_memory** / elasticsearch | InMemory / Elasticsearch DocumentStore |
+| indexing | **in_memory** / elasticsearch(皆支援 `incremental: true` 增量 ingest) | InMemory / Elasticsearch DocumentStore |
 | query_transformation | **normalize** / passthrough / glossary / jargon_mapping / llm_rewrite / llm_decompose | 自訂元件(`list[str] → list[str]`) |
 | retrieval | **bm25** / embedding / hybrid(皆支援 `boost_k_factor` 候選放大) | 依 indexing 選 retriever;hybrid 走 RRF |
 | reranking | **none** / similarity / llm / llm_fact_check | ST cross-encoder / core LLMRanker / 自訂 LLMFactChecker |
@@ -45,6 +45,8 @@ Evaluation: JSONL 測試集 → 逐題查詢 → hit rate / MRR
 pip install -e ".[dev]"        # 核心(離線可跑,無 torch、無 ES)
 pip install -e ".[st]"         # 選配:sentence-transformers 模型(embedding / cross-encoder)
 pip install -e ".[es]"         # 選配:Elasticsearch
+pip install -e ".[service]"    # 選配:HTTP 服務模式(FastAPI + uvicorn)
+pip install -e ".[ocr]"        # 選配:PDF OCR(掃描檔、多欄表格版面)
 ```
 
 ## 執行
@@ -59,6 +61,61 @@ demo 會自動建立範例語料(`./data/raw`)與評估集(`./data/eval/qa.jsonl
 依序執行 ingestion → 查詢 → 評估,印出融合後檢索結果、實際送出的
 prompt(可稽核)、回答與 hit rate / MRR。
 
+### 逐步紀錄(trace)
+
+終端機預設只印重點(索引筆數、檢索結果、評估摘要、log 檔路徑);
+要看**中間每一步做了什麼**加 `--trace`:
+
+```bash
+python scripts/run_demo.py --config configs/condense.yaml --trace
+python scripts/run_demo.py --config configs/condense.yaml --trace --trace-docs 0   # 每步印出全部切片
+python scripts/run_demo.py --config configs/condense.yaml --log-level DEBUG        # 另含 LLM 實際 prompt 與回覆
+```
+
+會逐步列出:ingestion 各步驟的產出筆數(import → parse → chunk → stamp →
+embed → write)、query transformation 每一段改寫後的查詢、每條子查詢在
+**各路檢索器**與**每段重排**後的切片與分數(含該步移除了哪些切片)、
+以及 fusion 的最終結果。
+
+資料來源是 `query()` 回傳的 `trace` 欄位與 `run_ingestion()` 的
+`trace`,程式接入時可直接取用,不必解析 CLI 輸出:
+
+```python
+result = pipelines.query("...")
+for step in result["trace"]["subqueries"][0]["steps"]:
+    print(step["component"], step["type"], len(step["documents"]))
+```
+
+### Log 檔
+
+**每次執行都會寫一份完整紀錄**到 `logs/run-<時間戳>.log`,不需要任何旗標;
+路徑會印在執行結束時。內容比終端機多:
+
+| | 終端機 | log 檔 |
+|---|---|---|
+| 層級 | `--log-level`(預設 WARNING) | 一律 DEBUG |
+| 逐步紀錄 | 只在 `--trace` 時 | 一律完整 |
+| 每步切片 | 依 `--trace-docs` 截斷(預設 5) | 全印,不截斷 |
+| LLM 的 prompt 與回覆 | 需 `--log-level DEBUG` | 一律記錄 |
+| HTTP 請求、Haystack 元件執行順序 | ✗ | ✓ |
+
+```bash
+python scripts/run_demo.py --config configs/condense.yaml       # 自動寫 logs/run-*.log
+python scripts/run_demo.py --log-file logs/experiment-a.log     # 指定路徑
+python scripts/run_demo.py --no-log-file                        # 不寫檔
+```
+
+log 檔是 UTF-8。Windows PowerShell 5.1 的 `Get-Content` 預設用系統 ANSI 編碼
+讀檔,中文會變亂碼,要加旗標:
+
+```powershell
+Get-Content logs\run-20260802-154249.log -Encoding UTF8
+```
+
+程式接入用 `rag.logging_config.setup_logging(log_file, console_level)`;
+排版函式在 `rag.trace`(`format_ingestion_trace` / `format_query_trace`),
+終端機與 log 檔共用同一份實作。
+
 內建三份 config:
 
 | config | 組合 | 適用情境 |
@@ -67,6 +124,45 @@ prompt(可稽核)、回答與 hit rate / MRR。
 | `smoke.yaml` | 方法鏈 + LLM 拆解(mock 腳本)+ hybrid + LLM 重排(mock 腳本)+ fusion | 煙霧測試 |
 | `company.yaml` | ES + 公司 embedding API + 公司 LLM 閘道 + 雙段 rerank + fusion | 公司環境 |
 | `condense.yaml` | query condense(術語替換 + LLM 改寫)+ hybrid 候選放大 + rerank + LLM 事實查核 + top 3,**不做生成** | 檢索-only 服務 |
+| `docs.yaml` | 同 `condense.yaml`,但來源是混合文件(txt/md/pdf,auto 分流) | 測試自己的文件 |
+
+### 用自己的文件(txt / md / pdf 混放)
+
+把文件放進 **`./data/docs/`**(txt / md / pdf 混放皆可,子資料夾也會掃到),然後:
+
+```bash
+python scripts/run_demo.py --config configs/docs.yaml --query "你的問題"
+```
+
+`local_file` 是萬用 importer(預設收 `.txt` / `.md` / `.pdf`),搭配
+`parsing: auto` 依檔案類型自動分流(txt/md → 文字 converter、pdf →
+PyPDFToDocument),全部進**同一個索引**(一個 config = 一個 KB)。
+
+content_type 由 `extensions` 推導:同質(全文字或全 PDF)→ 該型別,
+可搭配單型別 parser(`plain_text` / `pdf`);異質 → `mixed`,只有 `auto`
+能接。所以**要用 `plain_text` 就得釘住 `extensions: [".txt", ".md"]`**,
+否則建構期會報不相容(訊息會提示改用 `auto`)。
+
+> 遷移註記:`pdf_file` import 方法已移除 —— 改用 `local_file`
+> (需要純 PDF 語意時加 `extensions: [".pdf"]`)。
+
+幾個常會想調的地方:
+
+- **OCR**(`parsing.params.ocr`,需 `pip install -e ".[ocr]"`):
+  - `auto`(預設):掃描檔(無文字層)的頁面自動 OCR;沒裝 OCR 時會
+    明確警告該檔「沒有產出任何切片」,不再靜默消失。
+  - `force`:全頁 OCR。**多欄 / 表格版面的 PDF(如榜單)必用** ——
+    pypdf 按內部串流順序抽字,視覺上相鄰的標題與內容會被打散重排,
+    OCR 按視覺位置輸出才正確。成本約每頁數秒,搭配 `incremental: true`
+    只有第一次(或檔案變更時)要付。
+- **切法**:`chunking.method` 可改 `page_based`(按頁切;混合語料下
+  txt/md 整檔視為一頁)或 `structure_based`;版面雜訊多時
+  `parsing.method` 改成鏈 `[auto, clean]`。
+- **索引**:`docs.yaml` 用獨立索引 `modular-rag-docs`,不會跟範例語料混在一起。
+  換 embedding 模型後必須換索引名或先刪索引(ES 的 `dense_vector` dims 建立後不可變)。
+- **要生成答案**:把 `generate_answer` 改成 `true`。
+- **評估**:`docs.yaml` 刻意不設 `evaluation` —— 內建的 `qa.jsonl` 是給範例語料的。
+  自備 JSONL 時 `doc_id` 就是檔案相對 `input_dir` 的路徑(例如 `manual.pdf`)。
 
 公司環境:
 
@@ -96,6 +192,55 @@ result["answer"]      # 回答
 result["documents"]   # 融合後切片(meta 含 doc_id/page/group_key/sources)
 result["prompt"]      # 實際送出的 prompt(可稽核)
 ```
+
+## 服務模式(HTTP API)
+
+`run_demo.py` 是批次模式:每次執行都重跑 ingestion。長駐服務改用
+`serve.py` —— **一份 config 啟動一個 KB 服務**,ingestion 與 inference
+同駐一個 process(共用 store,embedding 等跨階段設定結構上保證一致),
+啟動時 ingest 一次,之後查詢不再重建索引:
+
+```bash
+pip install -e ".[service]"
+python scripts/serve.py --config configs/docs.yaml               # 啟動並 ingest
+python scripts/serve.py --config configs/docs.yaml --skip-ingest # 索引已建好(會驗指紋)
+```
+
+端點(另有 `/docs` 自動 API 文件):
+
+```bash
+curl http://127.0.0.1:8000/health
+curl -X POST http://127.0.0.1:8000/query \
+     -H "Content-Type: application/json" \
+     -d '{"query": "混合檢索怎麼運作?"}'
+curl -X POST http://127.0.0.1:8000/reload   # 改了 YAML 的 inference 段後套用
+curl -X POST http://127.0.0.1:8000/ingest   # 資料或 ingestion 設定變更後全量重建
+```
+
+**啟動後只允許改 inference / evaluation 區塊。** ingestion 區塊
+(import / parsing / chunking / embedding / indexing)決定索引裡的
+內容,改了就必須重建索引 —— 服務以 **ingestion 指紋**強制這件事:
+ingest 時把 ingestion 區塊的 sha256(以展開前的原始 config 計算,
+機密不進雜湊)寫在索引旁(ES:index mapping `_meta`;in_memory:
+process 內),`/reload` 與 `--skip-ingest` 啟動時比對,不符即拒絕
+(409 / 拒啟)並導向 `POST /ingest`。
+
+注意事項:
+
+- **增量 ingest**(`indexing.params.incremental: true`,`docs.yaml` 已開),
+  兩層:**檔案層** —— 內容未變的檔案連 parse(含 OCR)都跳過(檔案
+  bytes 雜湊記在索引旁的 manifest;parsing/chunking 設定變更會使 manifest
+  作廢、全量重 parse);**切片層** —— 變更檔案中內容未變的切片跳過
+  embedding。回應的 `skipped_files` / `skipped_unchanged` 顯示兩層跳過量;
+  `documents_written: 0` 表示這次沒有任何變更。
+- **空來源回報**:沒有產出任何切片的檔案(掃描檔沒 OCR、解析失敗…)
+  會出現在回應的 `empty_sources` 與 log 警告中,不會靜默消失。
+- **單 worker**:store 與服務狀態都在 process 內,查詢 / 重建以 lock
+  序列化;不要用 `uvicorn --workers N`。
+- **in_memory 索引**:`/reload` 在 process 內沒問題,但重啟即失、
+  `--skip-ingest` 起來是空索引;正式服務請用 `elasticsearch`。
+- **重 ingest 不會刪除已移除檔案的舊切片**(upsert 語意,增量模式亦同):
+  來源檔案刪減後想要乾淨的索引,換索引名或先刪索引再 `/ingest`。
 
 ## 配置說明
 
@@ -256,7 +401,7 @@ TRANSFORM_FACTORIES["by_sentence"] = SlotFactory(build=_build_by_sentence)
 | reranking `lexical_overlap` | 內建 | 移除;請改用 `similarity`(效果遠佳)或 `llm` |
 | `custom_api` importer/parser | 內建 | 未移植(接外部服務請寫自訂元件,見「新增自訂方法」) |
 | FAISS 索引 | in_memory_faiss / id_map_faiss | `in_memory`(開發)/ `elasticsearch`(正式);索引持久化交給 ES |
-| service 模式(KB 管理 / 藍綠重建) | FastAPI 服務 | 未移植(v2 之後再議;ES alias 可承接大部分需求) |
+| service 模式(KB 管理 / 藍綠重建) | FastAPI 服務 | 已移植:`scripts/serve.py`(單 KB;ingestion 指紋守護設定一致性,見「服務模式」節) |
 
 ## 設計要點
 
