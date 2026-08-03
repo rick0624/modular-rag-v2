@@ -7,6 +7,7 @@ import pytest
 from conftest import make_config
 
 from rag.builder import (
+    FlexibleAPIRanker,
     _ElasticsearchParams,
     _elasticsearch_auth_kwargs,
     build_inference_pipeline,
@@ -162,6 +163,66 @@ class TestElasticsearchAuth:
         config = self._config(basic_auth=["elastic", "secret"])
         with pytest.raises(ConfigError, match="可接受的參數:.*username"):
             build_ingestion_pipeline(config)
+
+
+class TestAPIRerankSlot:
+    """api_rerank 走完整的 config → pipeline 路徑(元件行為見 test_api_reranker)。"""
+
+    def test_built_into_reranking_chain(self):
+        config = parse_config(
+            make_config(
+                inference={
+                    "reranking": {
+                        "method": "api_rerank",
+                        "params": {
+                            "endpoint": "https://rerank.example.com/v1/rerank",
+                            "headers": {"Authorization": "Bearer T"},
+                            "model": "rerank-v1",
+                            "top_k": 3,
+                        },
+                    }
+                }
+            )
+        )
+        outer, _meta = build_inference_pipeline(config)
+        # ranker 在 MultiQueryRetrievalStage 的內部 pipeline 裡(每個子查詢各跑一次)
+        ranker = outer.get_component("multi_query").inner.get_component("ranker")
+        assert isinstance(ranker, FlexibleAPIRanker)
+        assert ranker.top_k == 3 and ranker.model == "rerank-v1"
+        assert ranker.headers == {"Authorization": "Bearer T"}
+
+    def test_endpoint_is_required(self):
+        config = parse_config(
+            make_config(
+                inference={"reranking": {"method": "api_rerank", "params": {"top_k": 3}}}
+            )
+        )
+        with pytest.raises(ConfigError, match="endpoint"):
+            build_inference_pipeline(config)
+
+    def test_index_base_must_be_zero_or_one(self):
+        config = parse_config(
+            make_config(
+                inference={
+                    "reranking": {
+                        "method": "api_rerank",
+                        "params": {
+                            "endpoint": "https://rerank.example.com/v1/rerank",
+                            "index_base": 2,
+                        },
+                    }
+                }
+            )
+        )
+        with pytest.raises(ConfigError, match="index_base"):
+            build_inference_pipeline(config)
+
+    def test_listed_as_available_method(self):
+        config = parse_config(
+            make_config(inference={"reranking": {"method": "api_reranking"}})
+        )
+        with pytest.raises(UnknownMethodError, match="'api_rerank'"):
+            build_inference_pipeline(config)
 
 
 class TestBoostKFactor:

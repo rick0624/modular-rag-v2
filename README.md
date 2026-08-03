@@ -28,7 +28,7 @@ Evaluation: JSONL 測試集 → 逐題查詢 → hit rate / MRR
 | indexing | **in_memory** / elasticsearch(皆支援 `incremental: true` 增量 ingest) | InMemory / Elasticsearch DocumentStore |
 | query_transformation | **normalize** / passthrough / glossary / jargon_mapping / llm_rewrite / llm_decompose | 自訂元件(`list[str] → list[str]`) |
 | retrieval | **bm25** / embedding / hybrid(皆支援 `boost_k_factor` 候選放大) | 依 indexing 選 retriever;hybrid 走 RRF |
-| reranking | **none** / similarity / llm / llm_fact_check | ST cross-encoder / core LLMRanker / 自訂 LLMFactChecker |
+| reranking | **none** / similarity / api_rerank / llm / llm_fact_check | ST cross-encoder / 自訂 Flexible API ranker / core LLMRanker / 自訂 LLMFactChecker |
 | generation | **mock** / openai / gateway_openai_compatible(`generate_answer: false` 可跳過) | OpenAIChatGenerator / 自訂閘道 generator |
 | fusion(內建步驟) | rrf / concat_dedup / max_score × group_by none/doc/page | 自訂 SubqueryFusion(v1 演算法) |
 | evaluation | basic_retrieval_metrics | hit rate / MRR(doc_id 依名次去重) |
@@ -396,6 +396,37 @@ TRANSFORM_FACTORIES["by_sentence"] = SlotFactory(build=_build_by_sentence)
 | `{"result": {"embeddings": [[...], ...]}}` | `embeddings_field: result.embeddings` |
 | `{"data": [{"embedding": [...]}, ...]}`(OpenAI 式) | `embeddings_field: data` + `item_field: embedding` |
 | `[[...], ...]`(回應本身就是清單,如 HuggingFace TEI) | `embeddings_field: null` |
+
+## api_rerank 請求 / 回應形狀對映表
+
+同樣的作法用在 rerank API 上。預設值對應的形狀是請求
+`{"question", "documents", "model"}`、回應 `{"returnData": [{"index", "score"}]}`:
+
+| API 形狀 | 設定 |
+|---|---|
+| 請求 `{"question", "documents", "model"}` | 預設值即可 |
+| 請求 `{"query", "documents"}` | `query_field: query` |
+| 回應 `{"returnData": [{"index", "score"}]}` | 預設值即可 |
+| 回應 `{"results": [{"index", "relevance_score"}]}`(Cohere 式) | `results_field: results` + `score_field: relevance_score` |
+| 回應 `[{"index", "score"}]`(回應本身就是清單) | `results_field: null` |
+| 回應的 `index` 從 1 起算 | `index_base: 1` |
+| 分數是「距離」(越小越相關) | `higher_is_better: false` |
+
+行為上要知道的幾件事:
+
+- **`index` 指的是候選在送出清單中的位置**,不是文件 id。`index_base`
+  設錯會讓結果整體位移一格 —— 全部越界時會直接報錯並提示改設哪個值,
+  但只差一格而沒越界時偵測不到,接線時請先確認 API 文件。
+- **回應未列出的候選視同淘汰**,與 `llm` 重排的協定一致。API 端若有
+  自己的 top_n,最終筆數會是它與 `top_k` 取小。
+- **不自動分批**:rerank 的分數只在同一次呼叫內可比,分批送會讓排序
+  失真。候選數由 `retrieval` 的 `top_k` × `boost_k_factor` 決定,
+  API 有長度上限時請從那裡收斂。
+- **fail-soft**:API 掛掉或回應解析不了時記 WARNING 並保留原檢索順序
+  (前 `top_k` 筆),查詢不中斷。初次接線建議先設 `raise_on_failure: true`
+  把欄位對映確認好再關掉。
+- **多子查詢會多次呼叫**:`llm_decompose` 拆成 N 個子查詢時,每個子查詢
+  各跑一次重排 → N 次 API 呼叫(`similarity` / `llm` 也是如此)。
 
 ## 接入實際 LLM
 

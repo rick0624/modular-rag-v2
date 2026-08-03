@@ -71,10 +71,27 @@ inference:
 
   reranking:
     method: [similarity, llm]       # 雙段:cross-encoder 收斂 → LLM 精排
+    #
+    # 改用公司的 rerank API:把上面那行換成
+    #     method: api_rerank
+    # (或串成 [api_rerank, llm_fact_check]),取消下方 api_rerank 區塊的
+    # 註解,並在 .env 補上 COMPANY_RERANK_API_KEY。
+    # ${ENV_VAR} 在載入時就展開,未啟用的區塊也會檢查 —— 所以整段
+    # 註解掉而不是留在那裡。
     method_params:
       similarity:                   # 需安裝:pip install -e ".[st]"
         model: cross-encoder/ms-marco-MiniLM-L-6-v2
         top_k: 10
+      # api_rerank:                 # 公司 rerank API(取代本地 cross-encoder)
+      #   endpoint: https://your-company-rerank.example.com/v1/rerank
+      #   headers:
+      #     Authorization: Bearer ${COMPANY_RERANK_API_KEY}
+      #   model: your-rerank-model  # 閘道不接受 model 欄位時,刪掉此行即可
+      #   top_k: 5
+      #   # 預設請求 {question, documents, model}、回應
+      #   # {"returnData": [{"index", "score"}]};形狀不同時用
+      #   # query_field / results_field / index_field / score_field 對應,
+      #   # index 從 1 起算的 API 另設 index_base: 1(見 configs/default.yaml)
       llm:
         top_k: 5
         # 未指定 generator:沿用 generation 槽位的公司閘道
