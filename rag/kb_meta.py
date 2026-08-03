@@ -36,12 +36,25 @@ MANIFEST_KEY = "modular_rag_source_manifest"
 _MANIFEST_ATTR = "_modular_rag_source_manifest"
 
 
+_OPERATIONAL_INDEXING_KEYS = (
+    "incremental",
+    # 連線憑證與 TLS 設定:決定「連不連得上」,不決定索引裡有什麼。
+    # 補上認證(或換一組)不該讓既有索引被判定為過期。
+    "api_key",
+    "username",
+    "password",
+    "ca_certs",
+    "verify_certs",
+)
+
+
 def _strip_operational_keys(ingestion: Any) -> Any:
     """移除不影響索引「內容」的操作旗標,避免指紋誤報。
 
     ``indexing.params.incremental``(與 ``method_params.*.incremental``)
     只決定 ingest 的執行方式(跳不跳過未變切片),開關它不會讓索引內容
-    與設定不一致 —— 不該觸發「請重建索引」。
+    與設定不一致 —— 不該觸發「請重建索引」。ES 的認證 / TLS 欄位同理:
+    只影響連線本身,索引的位置仍由 ``hosts`` 與 ``index`` 決定。
     """
     if not isinstance(ingestion, dict):
         return ingestion
@@ -50,12 +63,14 @@ def _strip_operational_keys(ingestion: Any) -> Any:
     if isinstance(indexing, dict):
         params = indexing.get("params")
         if isinstance(params, dict):
-            params.pop("incremental", None)
+            for key in _OPERATIONAL_INDEXING_KEYS:
+                params.pop(key, None)
         method_params = indexing.get("method_params")
         if isinstance(method_params, dict):
             for block in method_params.values():
                 if isinstance(block, dict):
-                    block.pop("incremental", None)
+                    for key in _OPERATIONAL_INDEXING_KEYS:
+                        block.pop(key, None)
     return result
 
 

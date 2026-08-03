@@ -491,11 +491,53 @@ def _build_in_memory_store(raw: dict[str, Any], ctx: BuildContext) -> Any:
 class _ElasticsearchParams(_IndexingCommonParams):
     hosts: str | list[str] = Field(description="ES 端點,如 http://localhost:9200")
     index: str = Field(default="modular-rag", description="索引名稱")
-    api_key: str | None = Field(default=None, description="API key(選填)")
+    api_key: str | None = Field(
+        default=None,
+        description="ES API key(base64 的 'id:api_key' 形式);與 username/password 擇一",
+    )
+    username: str | None = Field(
+        default=None, description="basic auth 帳號;需與 password 成對提供"
+    )
+    password: str | None = Field(
+        default=None, description="basic auth 密碼;需與 username 成對提供"
+    )
+    ca_certs: str | None = Field(
+        default=None, description="CA 憑證路徑(https 叢集用私有 CA 簽發時需要)"
+    )
+    verify_certs: bool | None = Field(
+        default=None, description="是否驗證伺服器憑證(預設 true;關閉會失去傳輸層保護)"
+    )
+
+
+def _elasticsearch_auth_kwargs(p: Any) -> dict[str, Any]:
+    """把認證欄位翻成 elasticsearch client 參數,並擋掉半套的組合。
+
+    開了 security 的叢集(公司 / Elastic Cloud 叢集預設如此)沒帶憑證時,
+    第一個請求就會收到 401 ``missing authentication credentials``;
+    本函式在建 store 前先確認 config 給的認證資訊是完整且不衝突的。
+    """
+    if (p.username is None) != (p.password is None):
+        missing = "password" if p.username is not None else "username"
+        raise ConfigError(
+            f"模組 'indexing' 方法 'elasticsearch' 的 username 與 password 必須成對提供,"
+            f"目前缺少 {missing}。"
+        )
+    if p.api_key is not None and p.username is not None:
+        raise ConfigError(
+            "模組 'indexing' 方法 'elasticsearch' 的 api_key 與 username/password 只能擇一:"
+            "Elasticsearch client 不接受同時帶兩種認證。"
+        )
+    if p.api_key is not None:
+        return {"api_key": p.api_key}
+    if p.username is not None:
+        # 必須是 2 元組/清單:字串形式會被 client 當成「已編碼」原樣送出。
+        return {"basic_auth": (p.username, p.password)}
+    return {}
 
 
 def _build_elasticsearch_store(raw: dict[str, Any], ctx: BuildContext) -> Any:
     p = _validate_params("indexing", "elasticsearch", _ElasticsearchParams, raw)
+    auth = _elasticsearch_auth_kwargs(p)
     try:
         from haystack_integrations.document_stores.elasticsearch import (
             ElasticsearchDocumentStore,
@@ -508,9 +550,12 @@ def _build_elasticsearch_store(raw: dict[str, Any], ctx: BuildContext) -> Any:
         "hosts": p.hosts,
         "index": p.index,
         "embedding_similarity_function": "cosine",
+        **auth,
     }
-    if p.api_key is not None:
-        kwargs["api_key"] = p.api_key
+    if p.ca_certs is not None:
+        kwargs["ca_certs"] = p.ca_certs
+    if p.verify_certs is not None:
+        kwargs["verify_certs"] = p.verify_certs
     return ElasticsearchDocumentStore(**kwargs)
 
 
