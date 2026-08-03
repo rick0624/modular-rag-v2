@@ -3,6 +3,9 @@
     docker compose up -d
     pip install -e ".[dev,es]"
     ES_URL=http://localhost:9200 python -m pytest -m es
+
+叢集有開 security 時,另外帶 ES_API_KEY 或 ES_USERNAME/ES_PASSWORD
+(必要時 ES_CA_CERTS);沒帶會收到 401 missing authentication credentials。
 """
 
 from __future__ import annotations
@@ -24,6 +27,19 @@ pytestmark = [
 ]
 
 
+def _auth_params() -> dict:
+    """指向有開 security 的叢集時,從環境變數帶認證(否則會 401)。"""
+    params = {}
+    if os.environ.get("ES_API_KEY"):
+        params["api_key"] = os.environ["ES_API_KEY"]
+    elif os.environ.get("ES_USERNAME"):
+        params["username"] = os.environ["ES_USERNAME"]
+        params["password"] = os.environ.get("ES_PASSWORD", "")
+    if os.environ.get("ES_CA_CERTS"):
+        params["ca_certs"] = os.environ["ES_CA_CERTS"]
+    return params
+
+
 @pytest.fixture
 def es_config_dict(corpus_dir):
     index = f"modular-rag-test-{uuid.uuid4().hex[:8]}"
@@ -32,7 +48,7 @@ def es_config_dict(corpus_dir):
             "import": {"method": "local_file", "params": {"input_dir": str(corpus_dir), "extensions": [".txt"]}},
             "indexing": {
                 "method": "elasticsearch",
-                "params": {"hosts": ES_URL, "index": index},
+                "params": {"hosts": ES_URL, "index": index, **_auth_params()},
             },
         },
         inference={

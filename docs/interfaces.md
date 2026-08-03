@@ -105,6 +105,10 @@ Evaluation: JSONL 測試集 → 逐題 RagPipelines.query() → hit_rate / MRR
   `${ENV_VAR}` 機密不進雜湊;解析後的 dict → 註解 / 排版 / anchor
   重構不影響。已知盲區:env var **值**的輪替、escape-hatch pipeline
   檔的內容變更。
+- 指紋**排除操作性欄位**:`indexing` 的 `incremental` 與連線憑證 / TLS
+  (`api_key` / `username` / `password` / `ca_certs` / `verify_certs`)——
+  它們決定「怎麼跑」與「連不連得上」,不決定索引裡有什麼;索引位置仍由
+  `hosts` 與 `index` 決定(改了就會偵測到)。
 - 儲存位置:`elasticsearch` → index mapping `_meta`(跟索引走);
   其他 → store 物件屬性(單 process 內有效)。
 - `/reload` 只重建 inference(store 沿用);指紋不符 → **409**,

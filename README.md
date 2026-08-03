@@ -172,6 +172,42 @@ docker compose up -d           # 或指向既有 ES 叢集
 python scripts/run_demo.py --config configs/company.yaml
 ```
 
+#### 連到有認證的 Elasticsearch
+
+`docker-compose.yml` 的本地 ES 關掉了 security,所以不用帶憑證;正式 /
+公司叢集預設是開著的,沒帶憑證時第一個請求就會失敗:
+
+```
+AuthenticationException(401, 'security_exception',
+  'missing authentication credentials for REST request [/]')
+```
+
+這不是設定錯誤,而是**還沒設定認證**。在 `indexing.params` 補上一組
+(兩者擇一,機密一律用 `${ENV_VAR}` 從 `.env` 注入):
+
+```yaml
+indexing:
+  method: elasticsearch
+  params:
+    hosts: ${ES_URL}
+    index: modular-rag-company
+    username: ${ES_USERNAME}     # basic auth,需與 password 成對
+    password: ${ES_PASSWORD}
+    # api_key: ${ES_API_KEY}     # 或改用 API key(base64 的 "id:api_key")
+    # ca_certs: ${ES_CA_CERTS}   # https 且憑證由私有 CA 簽發時
+```
+
+補完再跑一次即可。相關細節:
+
+- **`username` / `password` 必須成對**,且不能與 `api_key` 併用 —— 兩種
+  情況都在建 pipeline 時就報錯,不會拖到送出請求才失敗。
+- 憑證也可以直接寫在 URL 裡(`ES_URL=https://user:pass@es.example.com:9200`),
+  client 認得;但密碼含特殊字元時要先 URL-encode,且 URL 常被記進 log,
+  仍建議用上面的欄位。
+- 換成 401 以外的錯誤代表認證已經通了:`403` 是帳號權限不足(需要目標索引的
+  `create_index` / `read` / `write`),連線階段的 TLS 錯誤則用 `ca_certs`
+  指到公司 CA 憑證解決。
+
 ### 測試
 
 ```bash

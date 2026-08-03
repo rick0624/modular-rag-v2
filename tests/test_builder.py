@@ -1,5 +1,5 @@
 """builder 測試:未知方法、方法鏈規則、參數驗證、no_chunking、
-boost_k_factor、檢索-only(generate_answer: false)。"""
+ES 認證欄位、boost_k_factor、檢索-only(generate_answer: false)。"""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import pytest
 from conftest import make_config
 
 from rag.builder import (
+    _ElasticsearchParams,
+    _elasticsearch_auth_kwargs,
     build_inference_pipeline,
     build_ingestion_pipeline,
     build_pipelines,
@@ -104,6 +106,62 @@ def test_no_chunking_skips_splitter(corpus_dir):
     docs = store.filter_documents()
     # 每份文件恰好一個切片(seq 固定為 0)
     assert sorted(d.id for d in docs) == ["faiss.txt::chunk_0", "sub/es.txt::chunk_0"]
+
+
+class TestElasticsearchAuth:
+    """ES 認證欄位:半套 / 衝突的組合在建 pipeline 時就擋下,不拖到送請求。"""
+
+    @staticmethod
+    def _config(**params):
+        return parse_config(
+            make_config(
+                ingestion={
+                    "indexing": {
+                        "method": "elasticsearch",
+                        "params": {"hosts": "https://es.example.com:9200", **params},
+                    }
+                }
+            )
+        )
+
+    def test_username_without_password_fails(self):
+        config = self._config(username="elastic")
+        with pytest.raises(ConfigError, match="必須成對提供,目前缺少 password"):
+            build_ingestion_pipeline(config)
+
+    def test_password_without_username_fails(self):
+        config = self._config(password="secret")
+        with pytest.raises(ConfigError, match="必須成對提供,目前缺少 username"):
+            build_ingestion_pipeline(config)
+
+    def test_api_key_and_basic_auth_are_mutually_exclusive(self):
+        config = self._config(api_key="tok", username="elastic", password="secret")
+        with pytest.raises(ConfigError, match="只能擇一"):
+            build_ingestion_pipeline(config)
+
+    def test_basic_auth_becomes_two_item_tuple(self):
+        # 字串形式("user:pass")會被 elasticsearch client 當成已編碼的值
+        # 原樣送出,認證必失敗 —— 這裡釘住 2 元組。
+        params = _ElasticsearchParams(
+            hosts="https://es.example.com:9200", username="elastic", password="secret"
+        )
+        assert _elasticsearch_auth_kwargs(params) == {
+            "basic_auth": ("elastic", "secret")
+        }
+
+    def test_api_key_passed_through(self):
+        params = _ElasticsearchParams(hosts="https://es.example.com:9200", api_key="tok")
+        assert _elasticsearch_auth_kwargs(params) == {"api_key": "tok"}
+
+    def test_no_credentials_stays_empty(self):
+        # 本地 docker-compose 的 ES 關掉了 security,不帶憑證是合法的。
+        params = _ElasticsearchParams(hosts="http://localhost:9200")
+        assert _elasticsearch_auth_kwargs(params) == {}
+
+    def test_unknown_auth_field_lists_accepted_params(self):
+        config = self._config(basic_auth=["elastic", "secret"])
+        with pytest.raises(ConfigError, match="可接受的參數:.*username"):
+            build_ingestion_pipeline(config)
 
 
 class TestBoostKFactor:

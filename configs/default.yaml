@@ -97,7 +97,16 @@ ingestion:
         # 索引名帶上 embedding 模型:ES 的 dense_vector dims 建立後不可
         # 變更,換模型/維度就得換索引(或先刪掉重建)。
         index: modular-rag          # 預設 "modular-rag"
-        # api_key: YOUR_TOKEN       # 預設 None
+        # --- 認證:叢集開了 security 就必填,二選一 ---------------
+        # 沒帶憑證連到有 security 的叢集,第一個請求就會是
+        #   401 security_exception: missing authentication credentials
+        # (本地 docker-compose 的 ES 關掉了 security,所以不用填)
+        # api_key: YOUR_TOKEN       # 預設 None:base64 的 "id:api_key"
+        # username: elastic         # 預設 None:basic auth,需與 password 成對
+        # password: YOUR_PASSWORD   # 預設 None
+        # --- https 叢集的 TLS -------------------------------------
+        # ca_certs: /path/to/ca.crt # 預設 None:私有 CA 簽發的憑證需指定
+        # verify_certs: true        # 預設 true;設 false 會失去傳輸層保護
         # incremental: false        # 預設 false(同上)
 
 inference:

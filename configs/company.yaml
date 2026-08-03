@@ -8,6 +8,7 @@
 #   python scripts/run_demo.py --config configs/company.yaml
 #
 # 需要的環境變數:ES_URL、COMPANY_EMBEDDING_API_KEY、COMPANY_LLM_API_KEY
+# ES 叢集有開 security 時另需認證(見下方 indexing.params 註解)。
 
 ingestion:
   import:
@@ -44,6 +45,14 @@ ingestion:
     params:
       hosts: ${ES_URL}
       index: modular-rag-company
+      # 公司叢集通常開著 security:沒帶憑證會收到
+      #   401 security_exception: missing authentication credentials
+      # 取消註解其中一組(擇一),並在 .env 補上對應變數:
+      # username: ${ES_USERNAME}
+      # password: ${ES_PASSWORD}
+      # api_key: ${ES_API_KEY}
+      # https 且憑證由私有 CA 簽發時,另外指定 CA:
+      # ca_certs: ${ES_CA_CERTS}
 
 inference:
   query_transformation:

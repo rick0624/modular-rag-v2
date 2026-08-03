@@ -114,6 +114,34 @@ def test_incremental_flag_does_not_change_fingerprint():
     assert ingestion_fingerprint(flagged_mp) == ingestion_fingerprint(plain_mp)
 
 
+def test_es_credentials_do_not_change_fingerprint():
+    """認證欄位只影響連線,不影響索引內容:補上憑證不該要求重建索引。"""
+    base = make_config()
+    plain = copy.deepcopy(base)
+    plain["ingestion"]["indexing"] = {
+        "method": "elasticsearch",
+        "params": {"hosts": "${ES_URL}", "index": "kb"},
+    }
+    authed = copy.deepcopy(base)
+    authed["ingestion"]["indexing"] = {
+        "method": "elasticsearch",
+        "params": {
+            "hosts": "${ES_URL}",
+            "index": "kb",
+            "username": "${ES_USERNAME}",
+            "password": "${ES_PASSWORD}",
+            "ca_certs": "/etc/ssl/company-ca.crt",
+            "verify_certs": True,
+        },
+    }
+    assert ingestion_fingerprint(authed) == ingestion_fingerprint(plain)
+
+    # 但索引位置本身變了,仍要被偵測到
+    moved = copy.deepcopy(plain)
+    moved["ingestion"]["indexing"]["params"]["index"] = "kb2"
+    assert ingestion_fingerprint(moved) != ingestion_fingerprint(plain)
+
+
 def test_in_memory_roundtrip():
     store = InMemoryDocumentStore()
     assert read_fingerprint("in_memory", store) is None
