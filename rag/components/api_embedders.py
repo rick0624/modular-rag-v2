@@ -22,7 +22,8 @@ import httpx
 
 from haystack import Document, component
 
-from rag.errors import APICallError, APIResponseFormatError
+from rag.components.http_json import locate_list, post_json
+from rag.errors import APIResponseFormatError
 
 
 class _FlexibleAPIEmbedderCore:
@@ -80,68 +81,23 @@ class _FlexibleAPIEmbedderCore:
         return vectors
 
     def _request_json(self, body: dict[str, Any]) -> Any:
-        try:
-            if self._client is not None:
-                response = self._client.post(
-                    self.endpoint, json=body, headers=self.headers, timeout=self.timeout
-                )
-            else:
-                response = httpx.post(
-                    self.endpoint, json=body, headers=self.headers, timeout=self.timeout
-                )
-        except httpx.TimeoutException as exc:
-            raise APICallError(
-                f"呼叫 API 逾時({self.timeout} 秒):POST {self.endpoint}"
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise APICallError(
-                f"呼叫 API 失敗:POST {self.endpoint}({exc})"
-            ) from exc
-        if not 200 <= response.status_code < 300:
-            preview = response.text[:200]
-            raise APICallError(
-                f"API 回應非 2xx 狀態碼 {response.status_code}:POST {self.endpoint}"
-                f"(回應內容前 200 字:{preview!r})"
-            )
-        try:
-            return response.json()
-        except ValueError as exc:
-            raise APIResponseFormatError(
-                f"API 回應不是合法的 JSON:POST {self.endpoint}"
-            ) from exc
+        return post_json(
+            self.endpoint,
+            body,
+            headers=self.headers,
+            timeout=self.timeout,
+            client=self._client,
+        )
 
     def _locate_embeddings(self, data: Any) -> list[Any]:
-        """依 ``embeddings_field`` 路徑從回應中取出向量清單。
-
-        找不到時,錯誤訊息會列出該層實際存在的欄位,方便對照 API 回應
-        結構調整設定。
-        """
-        current: Any = data
-        if self.embeddings_field is not None:
-            for part in self.embeddings_field.split("."):
-                if not isinstance(current, dict) or part not in current:
-                    hint = (
-                        f"該層實際的欄位:{sorted(current.keys())}"
-                        if isinstance(current, dict)
-                        else f"該層實際型別:{type(current).__name__}"
-                    )
-                    raise APIResponseFormatError(
-                        f"embedding API 回應中找不到 '{self.embeddings_field}'"
-                        f"(在 '{part}' 處中斷);{hint}。"
-                        "請把 embeddings_field 設成你的 API 回應中向量清單所在的欄位"
-                        "(支援 a.b 巢狀路徑;回應本身就是清單時設為 null)"
-                    )
-                current = current[part]
-        if not isinstance(current, list):
-            location = (
-                f"'{self.embeddings_field}' 的值"
-                if self.embeddings_field is not None
-                else "embeddings_field 為 null 時,回應本身"
-            )
-            raise APIResponseFormatError(
-                f"{location}必須是 list,實際得到:{type(current).__name__}"
-            )
-        return current
+        """依 ``embeddings_field`` 路徑從回應中取出向量清單。"""
+        return locate_list(
+            data,
+            self.embeddings_field,
+            api_label="embedding API ",
+            setting_name="embeddings_field",
+            what="向量清單",
+        )
 
     def _to_vector(self, item: Any, position: int) -> list[float]:
         """把向量清單的單一元素轉成 ``list[float]``。

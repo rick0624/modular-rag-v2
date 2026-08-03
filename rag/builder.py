@@ -49,6 +49,7 @@ from rag.components.api_embedders import (
     FlexibleAPIDocumentEmbedder,
     FlexibleAPITextEmbedder,
 )
+from rag.components.api_reranker import FlexibleAPIRanker
 from rag.components.change_filter import IncrementalChangeFilter
 from rag.components.file_lister import FileLister
 from rag.components.pdf_ocr import PdfToDocument
@@ -1121,6 +1122,44 @@ def _build_llm_fact_check(raw: dict[str, Any], ctx: BuildContext) -> Any:
     )
 
 
+class _APIRerankParams(BaseParams):
+    endpoint: str = Field(description="rerank API 端點(完整 URL)")
+    headers: dict[str, str] = Field(
+        default_factory=dict, description="額外 HTTP 標頭(認證放這裡)"
+    )
+    model: str | None = Field(
+        default=None, description="模型名稱;None 時請求不帶該欄位"
+    )
+    top_k: int = Field(default=5, gt=0)
+    timeout: float = Field(default=30.0, gt=0)
+    query_field: str = Field(default="question", description="請求中放查詢的欄位名")
+    documents_field: str = Field(
+        default="documents", description="請求中放候選文字的欄位名"
+    )
+    model_field: str = Field(default="model", description="請求中放模型的欄位名")
+    results_field: str | None = Field(
+        default="returnData",
+        description="回應中結果清單的欄位(支援 a.b;回應本身是清單時設 null)",
+    )
+    index_field: str = Field(default="index", description="結果元素中名次索引的欄位名")
+    score_field: str = Field(default="score", description="結果元素中分數的欄位名")
+    index_base: int = Field(
+        default=0, ge=0, le=1, description="回應 index 的起算基準(0 或 1)"
+    )
+    higher_is_better: bool = Field(
+        default=True, description="分數越大越相關;回傳距離的 API 設 false"
+    )
+    raise_on_failure: bool = Field(
+        default=False,
+        description="API 失敗時中斷查詢;預設 false = 保留原檢索順序並記警告",
+    )
+
+
+def _build_api_ranker(raw: dict[str, Any], ctx: BuildContext) -> Any:
+    p = _validate_params("reranking", "api_rerank", _APIRerankParams, raw)
+    return FlexibleAPIRanker(**p.model_dump())
+
+
 class _NoRerankParams(BaseParams):
     pass
 
@@ -1133,6 +1172,7 @@ def _build_no_rerank(raw: dict[str, Any], ctx: BuildContext) -> None:
 RERANKING_FACTORIES: dict[str, SlotFactory] = {
     "none": SlotFactory(build=_build_no_rerank),
     "similarity": SlotFactory(build=_build_similarity_ranker),
+    "api_rerank": SlotFactory(build=_build_api_ranker),
     "llm": SlotFactory(build=_build_llm_ranker),
     "llm_fact_check": SlotFactory(build=_build_llm_fact_check),
 }

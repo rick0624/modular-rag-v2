@@ -155,8 +155,8 @@ inference:
         # boost_k_factor: 1
 
   reranking:
-    # 可選:none / similarity / llm / llm_fact_check
-    # 鏈(可串接):[similarity, llm] 或 [similarity, llm_fact_check]
+    # 可選:none / similarity / api_rerank / llm / llm_fact_check
+    # 鏈(可串接):[similarity, llm] 或 [api_rerank, llm_fact_check]
     method: none
     method_params:
       none: {}                      # 不重排(無參數)
@@ -164,6 +164,28 @@ inference:
         # 中文語料請用多語模型;英文的 ms-marco-MiniLM 對中文毫無鑑別力
         model: cross-encoder/mmarco-mMiniLMv2-L12-H384-v1   # 預設為英文 ms-marco
         top_k: 10                   # 預設 10
+      api_rerank:                   # 通用 HTTP rerank API(形狀見 README 對映表)
+        endpoint: https://rerank.example.com/v1/rerank   # 必填
+        headers:                    # 預設 {}
+          Authorization: Bearer YOUR_TOKEN
+        model: your-rerank-model    # 預設 None(不帶 model 欄位)
+        top_k: 5                    # 預設 5
+        # timeout: 30.0             # 預設 30.0
+        # --- 請求欄位名 -------------------------------------------
+        # query_field: question     # 預設 "question"
+        # documents_field: documents    # 預設 "documents"
+        # model_field: model        # 預設 "model"
+        # --- 回應欄位名 -------------------------------------------
+        # results_field: returnData # 預設 "returnData";支援 a.b 巢狀路徑,
+        #                           # 回應本身就是清單時設為 null
+        # index_field: index        # 預設 "index"
+        # score_field: score        # 預設 "score"
+        # index_base: 0             # 預設 0:回應的 index 從 0 起算;
+        #                           # 1 起算的 API 設為 1(設錯會整體位移一格)
+        # higher_is_better: true    # 預設 true;回傳「距離」的 API 設 false
+        # raise_on_failure: false   # 預設 false = API 掛掉時保留原檢索順序
+        #                           # 並記 WARNING;初次接線可設 true 讓錯誤
+        #                           # 直接炸出來,確認欄位對映無誤
       llm:                          # LLM listwise 重排
         top_k: 5                    # 預設 5
         # generator: {...}          # 預設 None = 沿用 generation 槽位
