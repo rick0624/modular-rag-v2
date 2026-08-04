@@ -30,7 +30,7 @@ Evaluation: JSONL 測試集 → 逐題查詢 → hit rate / MRR
 | query_transformation | **normalize** / passthrough / glossary / jargon_mapping / llm_rewrite / llm_decompose / custom | 自訂元件(`list[str] → list[str]`) |
 | retrieval | **bm25** / embedding / hybrid(皆支援 `boost_k_factor` 候選放大) / custom | 依 indexing 選 retriever;hybrid 走 RRF |
 | reranking | **none** / similarity / api_rerank / llm / llm_fact_check / custom | ST cross-encoder / 自訂 Flexible API ranker / core LLMRanker / 自訂 LLMFactChecker |
-| generation | **mock** / openai / gateway_openai_compatible(`generate_answer: false` 可跳過) | OpenAIChatGenerator / 自訂閘道 generator |
+| generation | **mock** / openai / gateway_openai_compatible / custom(`generate_answer: false` 可跳過) | OpenAIChatGenerator / 自訂閘道 generator / 自訂元件(`messages → replies`) |
 | routing(選填槽位,省略=不做) | keyword_match / custom | 自訂 KeywordRouteClassifier;結果進 `query()` 的 `routing` key,不影響檢索 |
 | fusion(內建步驟) | rrf / concat_dedup / max_score × group_by none/doc/page | 自訂 SubqueryFusion(v1 演算法) |
 | evaluation | basic_retrieval_metrics | hit rate / MRR(doc_id 依名次去重) |
@@ -66,6 +66,40 @@ python scripts/run_demo.py --config configs/company.yaml    # 公司環境(見�
 demo 會自動建立範例語料(`./data/raw`)與評估集(`./data/eval/qa.jsonl`),
 依序執行 ingestion → 查詢 → 評估,印出融合後檢索結果、實際送出的
 prompt(可稽核)、回答與 hit rate / MRR。
+
+### 分階段執行(`--stage`)
+
+兩支腳本都吃 `--stage`,決定這個 process 做哪一段。**只決定建不建那條
+pipeline,不改變任何一條的組法**,所以半條與整條的行為完全一致:
+
+| `--stage` | `run_demo.py` | `serve.py` |
+|---|---|---|
+| `all`(預設) | ingestion → 查詢 → 評估 | 啟動時 ingest 一次,再開服務 |
+| `ingestion` | 只建索引(寫 ingestion 指紋),不查詢也不評估 | 只建索引就結束,**不開 port** |
+| `inference` | 只查詢 + 評估,索引沿用既有內容 | 跳過啟動 ingestion,直接開服務 |
+
+```bash
+# 建索引(排程 / CI)→ 查詢端另外起,兩者靠 ingestion 指紋握手
+python scripts/serve.py   --config configs/docs.yaml --stage ingestion
+python scripts/serve.py   --config configs/docs.yaml --stage inference
+
+# 只測 inference:改 prompt / 改寫 / 重排的迭代不必每次重切塊 + 重算 embedding
+python scripts/run_demo.py --config configs/docs.yaml --stage inference --query "你的問題"
+```
+
+`--stage inference` 的前提是**索引裡已經有內容**:
+
+| 情形 | 行為 |
+|---|---|
+| `indexing: elasticsearch`(索引先前建好) | 比對 ingestion 指紋,不符會出聲(設定變了但索引沒重建 → 結果會無聲劣化);`serve.py` 直接拒絕啟動 |
+| `retrieval: custom`(外部檢索,不吃本地索引) | 直接跑 |
+| `indexing: in_memory` 且 retrieval 走本地索引 | 索引是空的 → 印警告,查詢不會有結果 |
+
+程式接入時對應 `build_pipelines(config, stage=...)`:沒建的那條在
+`RagPipelines` 上是 `None`,誤呼叫 `run_ingestion()` / `query()` 會直接
+報錯並指明要怎麼重建。服務端對應 `create_app(path, stage=...)` 與
+`rag.service.ingest_only(path)`。`serve.py --skip-ingest` 保留為
+`--stage inference` 的舊寫法。
 
 ### 逐步紀錄(trace)
 
@@ -238,16 +272,21 @@ result["routing"]     # 查詢分類結果(未設 routing 槽位時為 None)
 
 ## 服務模式(HTTP API)
 
-`run_demo.py` 是批次模式:每次執行都重跑 ingestion。長駐服務改用
-`serve.py` —— **一份 config 啟動一個 KB 服務**,ingestion 與 inference
-同駐一個 process(共用 store,embedding 等跨階段設定結構上保證一致),
-啟動時 ingest 一次,之後查詢不再重建索引:
+`run_demo.py` 是批次模式:跑完一題就結束。長駐服務改用 `serve.py` ——
+**一份 config 啟動一個 KB 服務**,ingestion 與 inference 同駐一個 process
+(共用 store,embedding 等跨階段設定結構上保證一致),啟動時 ingest 一次,
+之後查詢不再重建索引:
 
 ```bash
 pip install -e ".[service]"
-python scripts/serve.py --config configs/docs.yaml               # 啟動並 ingest
-python scripts/serve.py --config configs/docs.yaml --skip-ingest # 索引已建好(會驗指紋)
+python scripts/serve.py --config configs/docs.yaml                    # 啟動並 ingest
+python scripts/serve.py --config configs/docs.yaml --stage inference  # 索引已建好(會驗指紋)
+python scripts/serve.py --config configs/docs.yaml --stage ingestion  # 只建索引就結束(不開 port)
 ```
+
+讀寫分離部署:`--stage ingestion` 由排程 / CI 建索引,查詢服務用
+`--stage inference` 起來吃同一個 ES 索引,兩者靠 ingestion 指紋握手
+(見上方「分階段執行」)。
 
 端點(另有 `/docs` 自動 API 文件):
 
@@ -265,7 +304,7 @@ curl -X POST http://127.0.0.1:8000/ingest   # 資料或 ingestion 設定變更�
 內容,改了就必須重建索引 —— 服務以 **ingestion 指紋**強制這件事:
 ingest 時把 ingestion 區塊的 sha256(以展開前的原始 config 計算,
 機密不進雜湊)寫在索引旁(ES:index mapping `_meta`;in_memory:
-process 內),`/reload` 與 `--skip-ingest` 啟動時比對,不符即拒絕
+process 內),`/reload` 與 `--stage inference` 啟動時比對,不符即拒絕
 (409 / 拒啟)並導向 `POST /ingest`。
 
 注意事項:
@@ -281,7 +320,7 @@ process 內),`/reload` 與 `--skip-ingest` 啟動時比對,不符即拒絕
 - **單 worker**:store 與服務狀態都在 process 內,查詢 / 重建以 lock
   序列化;不要用 `uvicorn --workers N`。
 - **in_memory 索引**:`/reload` 在 process 內沒問題,但重啟即失、
-  `--skip-ingest` 起來是空索引;正式服務請用 `elasticsearch`。
+  `--stage inference` 起來是空索引;正式服務請用 `elasticsearch`。
 - **重 ingest 不會刪除已移除檔案的舊切片**(upsert 語意,增量模式亦同):
   來源檔案刪減後想要乾淨的索引,換索引名或先刪索引再 `/ingest`。
 
@@ -394,6 +433,7 @@ class BySentenceSplitter:
 | retrieval | `query: str` | `documents: list[Document]` |
 | reranking | `query: str` + `documents: list[Document]` | `documents: list[Document]` |
 | routing | `query: str` | `route: dict[str, Any]` |
+| generation | `messages: list[ChatMessage]` | `replies: list[ChatMessage]` |
 
 規則與慣例:
 
@@ -407,12 +447,22 @@ class BySentenceSplitter:
   才能直接運作。
 - custom 可出現在方法鏈中(`method: [normalize, custom]`),但同一條鏈
   只能有一個 `custom`(需要兩個時把邏輯合併成一個元件,或走路 B)。
-- generation / embedding / indexing 等其他槽位暫不支援 custom(factory
-  回傳形狀不是單一元件);有需求時走路 B。
+- **generation 的 custom 是「換掉 LLM 客戶端」,不是換掉 prompt 組裝**:
+  契約就是 Haystack 的 ChatGenerator 形狀,`prompt_template` /
+  `system_prompt` 照常寫在 YAML,元件收到的是框架組好的 messages。
+  同一支元件也能掛在 `llm_rewrite` / `llm_decompose` / `llm` /
+  `llm_fact_check` 的 `params.generator`,整條 pipeline 只走公司的推論
+  服務。OpenAI 相容的閘道**不需要**寫 custom,用
+  `gateway_openai_compatible` 即可。
+- embedding / indexing 槽位暫不支援 custom(factory 回傳形狀不是單一
+  元件:embedding 是 document / text 一對,indexing 是 document store);
+  有需求時走路 B。
 - 完整可跑的骨架見 [examples/custom_modules/](examples/custom_modules/)
-  (公司檢索 / 重排 / 分類三支,`TODO(替換點)` 標明換入真實邏輯的位置)
-  與 [configs/custom_demo.yaml](configs/custom_demo.yaml):
+  (公司改寫 / 檢索 / 重排 / 分類 / 生成五支,`TODO(替換點)` 標明換入
+  真實邏輯的位置)與 [configs/custom_demo.yaml](configs/custom_demo.yaml):
   `python scripts/run_demo.py --config configs/custom_demo.yaml --trace`
+  (custom retrieval 不吃本地索引,所以這份 config 也能加
+  `--stage inference` 只跑查詢)
 - 注意:custom module 就是執行任意 Python 程式碼,與 config 檔同一
   信任層級,只載入你信任的來源。
 

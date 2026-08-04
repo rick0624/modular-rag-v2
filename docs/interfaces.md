@@ -118,6 +118,7 @@ custom 元件無宣告可查,建構期直接檢視
 | retrieval | `query: str` | `documents: list[Document]` |
 | reranking | `query: str`、`documents: list[Document]` | `documents: list[Document]` |
 | routing | `query: str` | `route: dict[str, Any]` |
+| generation | `messages: list[ChatMessage]` | `replies: list[ChatMessage]` |
 
 驗證規則(不符 → `ConfigError`,訊息指明缺什麼、實際有什麼、怎麼改):
 
@@ -131,8 +132,16 @@ custom 元件無宣告可查,建構期直接檢視
   型別(內文 → `Document.content`、分數 → `score`、其餘無損進 `meta`),
   並建議補 §1 的 `doc_id` / `chunk_id` 契約鍵。槽位之間永遠只流
   canonical 型別 —— 讓公司格式流出邊界,就是模組間的兩兩耦合。
-- 其他槽位(generation / embedding / indexing …)的 factory 回傳形狀
-  不是單一元件,暫不支援 custom;需求出現時再為其設計契約。
+- **generation 的契約是 Haystack ChatGenerator 形狀**:prompt 仍由框架的
+  `ChatPromptBuilder` 組(`prompt_template` / `system_prompt` 照常寫在
+  YAML),custom 元件收到的是組好的 messages。因此同一支元件也能掛在
+  `llm_rewrite` / `llm_decompose` / reranking 的 `llm` 與 `llm_fact_check`
+  的 `params.generator` 底下 —— 那些方法本來就吃「generation 槽位的任一
+  方法」。回傳的 `replies` 至少要有一則(框架取 `replies[0]`),
+  `meta` 原樣進 `query()` 的 `reply_meta`。
+- 其他槽位(embedding / indexing …)的 factory 回傳形狀不是單一元件
+  (embedding 是 document / text 一對,indexing 是 document store),
+  暫不支援 custom;需求出現時再為其設計契約。
 
 範例骨架:`examples/custom_modules/` + `configs/custom_demo.yaml`
 (有整合測試 `tests/test_custom_demo.py` 保證永遠可跑)。

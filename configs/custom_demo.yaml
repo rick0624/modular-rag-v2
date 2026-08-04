@@ -1,12 +1,17 @@
-# Custom module 示範配置:retrieval / reranking / routing 三個槽位都掛
-# examples/custom_modules/ 下的自訂元件(公司系統整合的骨架)。
+# Custom module 示範配置:query_transformation / retrieval / reranking /
+# routing / generation 五個槽位都掛 examples/custom_modules/ 下的自訂元件
+# (公司系統整合的骨架)。
 #
-# 完全離線可跑(mock embedding + in_memory + mock 生成):
+# 完全離線可跑(mock embedding + in_memory + 骨架元件的離線回覆):
 #
 #   python scripts/run_demo.py --config configs/custom_demo.yaml --trace
 #
+# custom retrieval 不吃本地索引,所以這份 config 也可以只跑 inference:
+#
+#   python scripts/run_demo.py --config configs/custom_demo.yaml --stage inference
+#
 # 注意:custom module 的 file 路徑相對於「執行目錄」(repo 根)解析,
-# 不是 config 檔的位置。到公司整合時,把三支 .py 裡標了
+# 不是 config 檔的位置。到公司整合時,把這幾支 .py 裡標了
 # 「TODO(替換點)」的函式換成真正的邏輯即可,其餘串接不用動。
 
 ingestion:
@@ -34,8 +39,18 @@ ingestion:
     method: in_memory
 
 inference:
-  query_transformation:
-    method: normalize
+  query_transformation:             # custom 可放在方法鏈中(這裡接在 normalize 後)
+    method: [normalize, custom]     # 契約:queries: list[str] → queries: list[str]
+    method_params:
+      normalize:
+        lowercase: true
+      custom:
+        file: examples/custom_modules/company_query_transform.py
+        class: CompanyQueryExpander
+        init_params:
+          max_queries: 3
+          # synonyms:               # 不設定時用範例內建詞庫
+          #   請假: 請假 差勤申請
 
   retrieval:
     method: custom                  # 契約:query: str → documents: list[Document]
@@ -65,5 +80,16 @@ inference:
       #   default_category: 其他
 
   generation:
-    method: mock                    # 離線假答案;接公司 LLM 閘道時換
-                                    # gateway_openai_compatible(見 company.yaml)
+    method: custom                  # 契約:messages: list[ChatMessage]
+    params:                         #      → replies: list[ChatMessage]
+      file: examples/custom_modules/company_generator.py
+      class: CompanyLLMGenerator
+      # prompt 仍由框架組(這兩個選項與內建方法同款):
+      system_prompt: 你是公司內部知識庫的助理,只根據提供的內容回答。
+      # prompt_template: |          # 不設定時用內建模板
+      #   ...
+      init_params:
+        model: company-llm-v1
+        # endpoint: https://llm.example.com/v1/completions  # 設了就走真服務
+                                    # OpenAI 相容的閘道不必寫 custom,
+                                    # 直接用 gateway_openai_compatible(見 company.yaml)

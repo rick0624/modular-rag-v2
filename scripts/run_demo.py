@@ -7,11 +7,25 @@
     python scripts/run_demo.py --config configs/condense.yaml --trace
         # 終端機逐步印出每個元件做了什麼(改寫、各路檢索、每段重排、融合)
 
+``--stage`` 決定這次跑哪一段(預設 ``all``:ingestion → 查詢 → 評估):
+
+    python scripts/run_demo.py --config configs/docs.yaml --stage ingestion
+    python scripts/run_demo.py --config configs/docs.yaml --stage inference
+
+- ``ingestion``:只建索引(建完寫 ingestion 指紋,serve.py --stage
+  inference 起得來),不查詢也不評估。
+- ``inference``:只查詢 + 評估,索引沿用既有內容。改 prompt / 改寫 /
+  重排的迭代不必每次重新切塊與 embedding。適用於索引已建好
+  (elasticsearch,會比對 ingestion 指紋)、或 retrieval 走 custom 外部
+  檢索不吃本地索引時;in_memory 索引是空的,單獨用會查不到東西
+  (會出聲提醒)。
+
 每次執行都會另外寫一份完整紀錄到 ``logs/run-<時間戳>.log``
 (含 LLM 實際 prompt 與回覆、每步全部切片,不截斷);
 ``--log-file`` 可指定路徑,``--no-log-file`` 可關閉。
 
-長駐服務(不必每問一題重跑 ingestion)請用 scripts/serve.py。
+長駐服務(不必每問一題重跑 ingestion)請用 scripts/serve.py
+(同樣支援 ``--stage``)。
 """
 
 from __future__ import annotations
@@ -25,7 +39,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from rag import build_pipelines, load_config  # noqa: E402
+from rag.config import RAGConfig, load_raw_config  # noqa: E402
 from rag.evaluation import run_evaluation  # noqa: E402
+from rag.kb_meta import (  # noqa: E402
+    indexing_info,
+    ingestion_fingerprint,
+    read_fingerprint,
+    write_fingerprint,
+)
 from rag.logging_config import (  # noqa: E402
     default_log_path,
     quiet_dependency_handlers,
@@ -50,12 +71,101 @@ def _emit(lines: list[str], to_console: bool) -> None:
         logger.info(line)
 
 
+def _warn(message: str) -> None:
+    """終端機與 log 檔同時出聲(安靜地查一個空索引是最難查的問題)。
+
+    與 :func:`_emit` 同機制:print 負責終端機(不受 ``--log-level``
+    影響,一定看得到),log 走 INFO —— 用 warning 會被終端機 handler
+    再印一次,同一句話出現兩行。
+    """
+    print(f"⚠ {message}")
+    logger.info(message)
+
+
+def _stamp_fingerprint(config_path: str, config: RAGConfig, store: object) -> None:
+    """ingestion 成功後把設定指紋寫到索引旁(與服務模式同一機制)。
+
+    這是 ``--stage ingestion`` 與後續 ``--stage inference``(或
+    ``serve.py --stage inference``)之間的握手:指紋對得上,查詢端才敢
+    相信索引內容就是這份 config 產出的。in_memory 的指紋隨 process 消失,
+    寫了也不會有人讀到,但成本是零,不必為此分支。
+    """
+    method, index_name = indexing_info(config)
+    if not method:  # escape hatch:原生 ingestion pipeline,無槽位資訊
+        return
+    try:
+        write_fingerprint(
+            method, store, ingestion_fingerprint(load_raw_config(config_path)), index_name
+        )
+    except Exception as exc:  # 寫不進去不該讓已完成的 ingestion 算失敗
+        _warn(
+            f"索引建好了,但 ingestion 指紋寫入失敗"
+            f"({type(exc).__name__}: {exc});"
+            "之後以 --stage inference 啟動會因為指紋對不上而被擋下"
+        )
+
+
+def _report_skipped_ingestion(
+    config_path: str, config: RAGConfig, store: object
+) -> None:
+    """``--stage inference``:確認索引狀態,不一致就出聲(不中止)。
+
+    比照服務模式:elasticsearch 比對 ingestion 指紋(設定變了但索引沒重建
+    → 查詢結果會無聲劣化);in_memory 索引本來就是空的,除非 retrieval
+    走 custom(自帶外部檢索後端,不吃本地索引)。
+    """
+    method, index_name = indexing_info(config)
+    retrieval_method = (
+        config.inference.retrieval.methods()[0]
+        if config.inference is not None
+        else ""
+    )
+    if method != "elasticsearch":
+        if retrieval_method == "custom":
+            print(f"跳過 ingestion(retrieval 走 custom,不吃本地 {method} 索引)")
+        else:
+            _warn(
+                f"--stage inference 搭配 {method or 'in_memory'} 索引:索引是空的,"
+                "查詢不會有結果。持久化索引請改用 elasticsearch,"
+                "或改用 --stage all 重跑 ingestion"
+            )
+        return
+
+    try:
+        stored = read_fingerprint(method, store, index_name)
+    except Exception as exc:  # 連線失敗 / 索引不存在以外的錯誤
+        _warn(
+            f"--stage inference 但讀不到索引 '{index_name}' 上的 ingestion 指紋"
+            f"({type(exc).__name__}: {exc});無法確認索引與設定是否一致"
+        )
+        return
+    current = ingestion_fingerprint(load_raw_config(config_path))
+    if stored != current:
+        _warn(
+            f"--stage inference 但索引 '{index_name}' 上的 ingestion 指紋"
+            f"({(stored or '不存在')[:12]}…)與目前設定({current[:12]}…)不符;"
+            "索引內容可能與設定不一致(embedding 模型 / 切塊參數變了?)。"
+            "要以目前設定重建請改用 --stage all"
+        )
+        return
+    print(f"跳過 ingestion(索引 '{index_name}' 的 ingestion 指紋相符)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="modular-rag-v2 端到端 demo")
     parser.add_argument(
         "--config", default="configs/default.yaml", help="YAML 設定檔路徑"
     )
     parser.add_argument("--query", default="FAISS 支援哪些索引結構?", help="查詢文字")
+    parser.add_argument(
+        "--stage",
+        default="all",
+        choices=["all", "ingestion", "inference"],
+        help="這次跑哪一段:all=ingestion → 查詢 → 評估(預設);"
+        "ingestion=只建索引(並寫 ingestion 指紋);"
+        "inference=只查詢 + 評估,索引沿用既有內容"
+        "(elasticsearch 會比對 ingestion 指紋)",
+    )
     parser.add_argument(
         "--trace",
         action="store_true",
@@ -93,30 +203,43 @@ def main() -> None:
     ensure_sample_data()  # 範例語料與評估集(已存在的檔案不覆寫)
     config = load_config(args.config)
     logger.info("=" * 70)
-    logger.info("config=%s  query=%r", args.config, args.query)
+    logger.info(
+        "config=%s  stage=%s  query=%r", args.config, args.stage, args.query
+    )
     logger.info("=" * 70)
-    pipelines = build_pipelines(config)
+    pipelines = build_pipelines(config, stage=args.stage)
     quiet_dependency_handlers()  # 建 pipeline 時才載入的套件(HF…)補一次
 
-    logger.info("=== Ingestion(%s)===", args.config)
-    ingestion_result = pipelines.run_ingestion()
-    _emit(format_ingestion_trace(ingestion_result["trace"]), args.trace)
-    written = ingestion_result.get("writer", {}).get("documents_written") or 0
-    notes = []
-    skipped_chunks = ingestion_result.get("change_filter", {}).get("skipped")
-    if skipped_chunks:
-        notes.append(f"增量:{skipped_chunks} 筆切片未變更")
-    skipped_files = ingestion_result.get("source_filter", {}).get("skipped_files")
-    if skipped_files:
-        notes.append(f"{len(skipped_files)} 個檔案未變更未重新解析")
-    extra = f"({'; '.join(notes)})" if notes else ""
-    print(f"已索引 {written} 個切片{extra}({args.config})")
-    empty_sources = ingestion_result.get("empty_sources")
-    if empty_sources:
-        print(
-            f"⚠ 以下檔案沒有產出任何切片(掃描檔需要 OCR?詳見 log):"
-            f"{'、'.join(empty_sources)}"
-        )
+    if args.stage == "inference":
+        logger.info("=== 跳過 Ingestion(--stage inference)===")
+        _report_skipped_ingestion(args.config, config, pipelines.store)
+    else:
+        logger.info("=== Ingestion(%s)===", args.config)
+        ingestion_result = pipelines.run_ingestion()
+        _emit(format_ingestion_trace(ingestion_result["trace"]), args.trace)
+        written = ingestion_result.get("writer", {}).get("documents_written") or 0
+        notes = []
+        skipped_chunks = ingestion_result.get("change_filter", {}).get("skipped")
+        if skipped_chunks:
+            notes.append(f"增量:{skipped_chunks} 筆切片未變更")
+        skipped_files = ingestion_result.get("source_filter", {}).get("skipped_files")
+        if skipped_files:
+            notes.append(f"{len(skipped_files)} 個檔案未變更未重新解析")
+        extra = f"({'; '.join(notes)})" if notes else ""
+        print(f"已索引 {written} 個切片{extra}({args.config})")
+        empty_sources = ingestion_result.get("empty_sources")
+        if empty_sources:
+            print(
+                f"⚠ 以下檔案沒有產出任何切片(掃描檔需要 OCR?詳見 log):"
+                f"{'、'.join(empty_sources)}"
+            )
+        _stamp_fingerprint(args.config, config, pipelines.store)
+
+    if args.stage == "ingestion":
+        # 只建索引:不查詢也不評估(查詢請用 --stage inference / all)
+        if log_path is not None:
+            print(f"紀錄:{log_path}")
+        return
 
     logger.info("=== 查詢 === %s", args.query)
     result = pipelines.query(args.query)

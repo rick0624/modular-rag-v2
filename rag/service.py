@@ -14,6 +14,11 @@ ingestion 區塊(import / parsing / chunking / embedding / indexing)
 - ``POST /ingest``:ingestion 設定變更的唯一正道。重讀 YAML、全量重建
   兩條 pipeline(全新 store)、重跑 ingestion、更新指紋。
 
+階段選擇(``scripts/serve.py --stage``):``all``(預設)啟動時 ingest 一次
+再開服務;``inference`` 跳過啟動 ingestion(索引已建好,比對指紋);
+``ingestion`` 走 :func:`ingest_only` —— 只建索引、不開 port,供讀寫分離
+部署的 writer 端(排程 / CI)使用。
+
 併發:Haystack pipeline 不是 thread-safe,所有 run 與狀態切換都在同一
 把 ``threading.Lock`` 內(查詢會被進行中的 /ingest 擋住)。因此
 **uvicorn workers 必須為 1**(in-process store 與狀態無法跨 process)。
@@ -118,18 +123,55 @@ def _run_ingest_and_stamp(
     return result
 
 
-def create_app(config_path: str | Path, *, skip_ingest: bool = False) -> Any:
+def ingest_only(config_path: str | Path) -> dict[str, Any]:
+    """只建索引:跑完 ingestion、寫指紋,不啟動服務(``--stage ingestion``)。
+
+    讀寫分離部署的 writer 端 —— 由排程或 CI 呼叫把索引建好,查詢端再以
+    ``create_app(..., stage="inference")`` 起來吃同一個索引(指紋就是兩者
+    之間的握手:對不上就拒絕啟動)。因此只建 ingestion pipeline,
+    inference 側元件(reranker 模型等)完全不載入。
+
+    Returns:
+        ``run_ingestion()`` 的結果,外加 ``fingerprint``。
+
+    Raises:
+        ConfigError: 設定不合法。
+    """
+    path = Path(config_path)
+    raw = load_raw_config(path)
+    config = load_config(path)
+    fingerprint = ingestion_fingerprint(raw)
+    pipelines = build_pipelines(config, stage="ingestion")
+    result = _run_ingest_and_stamp(pipelines, config, fingerprint)
+    result["fingerprint"] = fingerprint
+    logger.info(
+        "ingestion 完成(未啟動服務):documents_written=%s fingerprint=%s",
+        _documents_written(result), fingerprint[:12],
+    )
+    return result
+
+
+def create_app(config_path: str | Path, *, stage: str = "all") -> Any:
     """建立 FastAPI app(建構期就載入 config 並建 pipeline,錯誤 fail-fast)。
 
     Args:
         config_path: YAML 設定檔路徑;之後 /ingest 與 /reload 都重讀此檔。
-        skip_ingest: 啟動時跳過 ingestion(索引已建好時用)。此時會比對
-            索引上的指紋,不符或缺失(elasticsearch)→ 拒絕啟動。
+        stage: ``"all"``(預設)啟動時跑一次 ingestion;``"inference"``
+            跳過(索引已建好時用),此時會比對索引上的指紋,不符或缺失
+            (elasticsearch)→ 拒絕啟動。只建索引不起服務請改用
+            :func:`ingest_only`。
 
     Raises:
         MissingDependencyError: 未安裝 fastapi(``pip install -e ".[service]"``)。
-        ConfigError: 設定不合法,或 --skip-ingest 時指紋不符。
+        ConfigError: 設定不合法、``stage`` 不合法,或 stage="inference"
+            時指紋不符。
     """
+    if stage not in ("all", "inference"):
+        raise ConfigError(
+            f"create_app 的 stage 只能是 'all' 或 'inference'(收到 '{stage}');"
+            "只建索引不起服務請用 rag.service.ingest_only()"
+        )
+    skip_ingest = stage == "inference"
     try:
         from fastapi import FastAPI, HTTPException
         from fastapi.requests import Request
@@ -145,24 +187,24 @@ def create_app(config_path: str | Path, *, skip_ingest: bool = False) -> Any:
     raw = load_raw_config(path)
     config = load_config(path)
     fingerprint = ingestion_fingerprint(raw)
-    pipelines = build_pipelines(config)
+    pipelines = build_pipelines(config, stage=stage)
 
     if skip_ingest:
         method, index_name = _indexing_info(config)
         stored = read_fingerprint(method, pipelines.store, index_name)
         if method == "elasticsearch" and stored != fingerprint:
             raise ConfigError(
-                f"--skip-ingest 但索引 '{index_name}' 上的 ingestion 指紋"
+                f"--stage inference 但索引 '{index_name}' 上的 ingestion 指紋"
                 f"({stored or '不存在'})與目前設定({fingerprint[:12]}…)不符。"
-                "索引內容可能與設定不一致;請移除 --skip-ingest 重新 ingest,"
+                "索引內容可能與設定不一致;請改用 --stage all 重新 ingest,"
                 "或啟動後呼叫 POST /ingest"
             )
         if method != "elasticsearch":
             logger.warning(
-                "--skip-ingest 搭配 %s 索引:索引是空的,查詢不會有結果;"
+                "--stage inference 搭配 %s 索引:索引是空的,查詢不會有結果;"
                 "請呼叫 POST /ingest 建立內容", method or "in_memory",
             )
-        logger.info("跳過啟動時 ingestion(--skip-ingest)")
+        logger.info("跳過啟動時 ingestion(--stage inference)")
         ingest_summary: dict[str, Any] | None = None
     else:
         result = _run_ingest_and_stamp(pipelines, config, fingerprint)
@@ -276,6 +318,7 @@ def create_app(config_path: str | Path, *, skip_ingest: bool = False) -> Any:
                 generate_answer=meta["generate_answer"],
                 transform_names=meta["transform_names"],
                 routing_enabled=meta["routing_enabled"],
+                stage=old.stage,  # /reload 不建 ingestion,沿用原本的建構意圖
             )
         logger.info("inference 設定重載完成")
         return ReloadResponse(status="reloaded", fingerprint=state.fingerprint)

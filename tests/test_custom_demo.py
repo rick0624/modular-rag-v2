@@ -1,4 +1,4 @@
-"""configs/custom_demo.yaml + examples/custom_modules/ 的端到端回歸。
+"""configs/custom_demo.yaml + examples/custom_modules/ 的端到端回歸(五個槽位)。
 
 這組範例是使用者帶去公司整合的骨架 —— 範例檔或示範 config 壞掉時
 本測試即紅,保證骨架永遠可跑。載入的是 repo 中**真正的**檔案,
@@ -49,12 +49,43 @@ def test_custom_demo_end_to_end(corpus_dir, monkeypatch):
     assert route["category"] == "人資/差勤"
     assert "請假" in route["matched_keywords"]
 
-    # 生成與 trace 排版都可用
-    assert result["answer"] is not None
+    # custom generation:骨架的離線回覆 + meta 帶出來
+    assert result["answer"].startswith("[公司 LLM 骨架回答]")
+    assert result["reply_meta"]["model"] == "company-llm-v1"
+    assert result["reply_meta"]["offline"] is True
+    # prompt 仍由框架組:YAML 的 system_prompt 有進去
+    assert "你是公司內部知識庫的助理" in result["prompt"]
+
     lines = format_query_trace(result["trace"])
     joined = "\n".join(lines)
     assert "Routing" in joined
     assert "人資/差勤" in joined
+
+
+def test_custom_demo_query_transformation_chain(corpus_dir, monkeypatch):
+    """[normalize, custom] 方法鏈:詞庫擴充 + 依連接詞拆成多條子查詢。"""
+    monkeypatch.chdir(REPO_ROOT)
+    pipelines = load_and_build(corpus_dir)
+    pipelines.run_ingestion()
+
+    result = pipelines.query("請假規則以及報帳流程?")
+
+    queries = result["trace"]["transforms"][-1]["queries"]
+    assert len(queries) == 2, "「以及」應拆成兩條子查詢"
+    assert any("差勤申請" in q for q in queries), "請假 應被詞庫擴充"
+    assert any("費用核銷" in q for q in queries), "報帳 應被詞庫擴充"
+    assert len(result["subquery_results"]) == 2
+
+
+def test_custom_demo_runs_inference_only(corpus_dir, monkeypatch):
+    """custom retrieval 不吃本地索引 → 這份 config 支援 --stage inference。"""
+    monkeypatch.chdir(REPO_ROOT)
+    pipelines = build_pipelines(load_demo_config(corpus_dir), stage="inference")
+
+    assert pipelines.ingestion is None
+    result = pipelines.query("請假規則怎麼申請?")
+    assert result["documents"], "custom retrieval 不需要先跑 ingestion"
+    assert result["answer"] is not None
 
 
 def load_and_build(corpus_dir):

@@ -3,7 +3,17 @@
 
     pip install -e ".[service]"
     python scripts/serve.py --config configs/docs.yaml
-    python scripts/serve.py --config configs/docs.yaml --skip-ingest   # 索引已建好
+    python scripts/serve.py --config configs/docs.yaml --stage inference # 索引已建好
+    python scripts/serve.py --config configs/docs.yaml --stage ingestion # 只建索引就結束
+
+``--stage`` 決定這個 process 做哪一段(預設 ``all``:啟動時 ingest 一次
+再開服務):
+
+- ``ingestion``:只建索引、寫指紋,**不開 port**(建完就結束)。讀寫分離
+  部署的 writer 端 —— 排程 / CI 建索引,查詢服務另外用 ``--stage inference``
+  起來吃同一個索引(指紋就是兩者之間的握手)。
+- ``inference``:跳過啟動時的 ingestion,索引沿用既有內容(elasticsearch
+  會比對 ingestion 指紋,不符則拒絕啟動)。
 
 端點:
     GET  /health   狀態(config、indexing 方法、ingestion 指紋)
@@ -11,7 +21,8 @@
     POST /reload   重讀 YAML,只重建 inference;ingestion 段變更 → 409
     POST /ingest   全量重建索引(ingestion 設定變更的唯一正道)
 
-批次執行(一次性 ingest → 查詢 → 評估)請用 scripts/run_demo.py。
+批次執行(一次性 ingest → 查詢 → 評估)請用 scripts/run_demo.py
+(同樣支援 ``--stage``)。
 """
 
 from __future__ import annotations
@@ -30,7 +41,7 @@ from rag.logging_config import (  # noqa: E402
     setup_logging,
 )
 from rag.sample_data import ensure_sample_data  # noqa: E402
-from rag.service import create_app  # noqa: E402
+from rag.service import create_app, ingest_only  # noqa: E402
 
 logger = logging.getLogger("rag.serve")
 
@@ -43,9 +54,17 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1", help="綁定位址")
     parser.add_argument("--port", type=int, default=8000, help="埠號")
     parser.add_argument(
+        "--stage",
+        default="all",
+        choices=["all", "ingestion", "inference"],
+        help="這個 process 做哪一段:all=啟動時 ingest 一次再開服務(預設);"
+        "ingestion=只建索引就結束(不開 port);"
+        "inference=跳過啟動 ingestion(索引已建好,會比對 ingestion 指紋)",
+    )
+    parser.add_argument(
         "--skip-ingest",
         action="store_true",
-        help="啟動時不跑 ingestion(索引已建好;會比對 ingestion 指紋)",
+        help="等同 --stage inference(舊旗標,保留相容)",
     )
     parser.add_argument(
         "--log-file", default=None, help="log 檔路徑(預設 logs/serve-<時間戳>.log)"
@@ -72,8 +91,31 @@ def main() -> None:
     if log_path is not None:
         print(f"完整紀錄:{log_path}")
 
+    if args.skip_ingest and args.stage == "ingestion":
+        parser.error(
+            "--skip-ingest 是 --stage inference 的舊寫法,與 --stage ingestion 互斥"
+        )
+    stage = "inference" if args.skip_ingest else args.stage
+
     ensure_sample_data()  # 範例語料與評估集(已存在的檔案不覆寫)
-    app = create_app(args.config, skip_ingest=args.skip_ingest)
+
+    if stage == "ingestion":
+        # 只建索引:不開 port,建完就結束(讀寫分離部署的 writer 端)。
+        result = ingest_only(args.config)
+        quiet_dependency_handlers()
+        written = (result.get("writer") or {}).get("documents_written") or 0
+        print(f"已索引 {written} 個切片({args.config})")
+        print(f"ingestion 指紋:{result['fingerprint']}")
+        empty_sources = result.get("empty_sources")
+        if empty_sources:
+            print(
+                f"⚠ 以下檔案沒有產出任何切片(掃描檔需要 OCR?詳見 log):"
+                f"{'、'.join(empty_sources)}"
+            )
+        print("(--stage ingestion:未啟動服務;查詢請以 --stage inference 起另一個 process)")
+        return
+
+    app = create_app(args.config, stage=stage)
     quiet_dependency_handlers()  # 建 pipeline 時才載入的套件(HF…)補一次
 
     import uvicorn

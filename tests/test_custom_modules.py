@@ -138,6 +138,41 @@ class WithDebugOutput:
         return {"queries": queries, "debug": {"count": len(queries)}}
 '''
 
+GENERATOR_OK = '''
+from typing import Any
+from haystack import component
+from haystack.dataclasses import ChatMessage
+
+
+@component
+class EchoGenerator:
+    """合約正確的 chat generator:回覆帶上收到的 messages 內容。"""
+
+    def __init__(self, prefix: str = "[custom]") -> None:
+        self.prefix = prefix
+
+    @component.output_types(replies=list[ChatMessage])
+    def run(self, messages: list[ChatMessage]) -> dict[str, Any]:
+        joined = " | ".join(m.text or "" for m in messages)
+        return {"replies": [ChatMessage.from_assistant(
+            f"{self.prefix} {joined}", meta={"model": "echo", "custom": True}
+        )]}
+'''
+
+GENERATOR_WRONG_SHAPE = '''
+from typing import Any
+from haystack import component
+
+
+@component
+class NotAChatGenerator:
+    """把 generation 槽位誤當成 transform 寫(常見誤解)。"""
+
+    @component.output_types(queries=list[str])
+    def run(self, queries: list[str]) -> dict[str, Any]:
+        return {"queries": queries}
+'''
+
 BROKEN_IMPORT = '''
 import nonexistent_module_xyz_for_test
 '''
@@ -285,6 +320,123 @@ class TestLoading:
         )
         with pytest.raises(UnknownMethodError, match="'custom'"):
             build_pipelines(config)
+
+
+class TestCustomGeneration:
+    """generation 槽位:契約是 Haystack ChatGenerator 形狀(messages → replies)。"""
+
+    @staticmethod
+    def _config(corpus_dir, file: str, **extra_params):
+        return parse_config(
+            make_config(
+                ingestion={
+                    "import": {
+                        "method": "local_file",
+                        "params": {
+                            "input_dir": str(corpus_dir),
+                            "extensions": [".txt"],
+                        },
+                    }
+                },
+                inference={
+                    "reranking": {"method": "none"},
+                    "generation": {
+                        "method": "custom",
+                        "params": {
+                            "file": file,
+                            "class": "EchoGenerator",
+                            **extra_params,
+                        },
+                    },
+                },
+            )
+        )
+
+    def test_custom_generation_end_to_end(self, tmp_path, corpus_dir):
+        file = write_module(tmp_path, GENERATOR_OK)
+        config = self._config(
+            corpus_dir, file, init_params={"prefix": "[公司 LLM]"}
+        )
+        pipelines = build_pipelines(config)
+        pipelines.run_ingestion()
+
+        result = pipelines.query("向量檢索")
+        assert result["answer"].startswith("[公司 LLM]")
+        # meta 原樣往外帶(事後查得到答案是誰生的)
+        assert result["reply_meta"]["custom"] is True
+        assert result["trace"]["generation"]["answer"] == result["answer"]
+
+    def test_prompt_options_still_apply(self, tmp_path, corpus_dir):
+        """prompt 由框架組:system_prompt / prompt_template 與內建方法同款。"""
+        file = write_module(tmp_path, GENERATOR_OK)
+        config = self._config(
+            corpus_dir,
+            file,
+            system_prompt="你是測試助理。",
+            # 自訂模板一樣要用到 documents(prompt_builder 的 socket 由
+            # 模板變數決定),與內建方法的限制相同
+            prompt_template="模板:{{ query }}/{{ documents|length }} 筆",
+        )
+        pipelines = build_pipelines(config)
+        pipelines.run_ingestion()
+
+        result = pipelines.query("向量檢索")
+        assert "你是測試助理。" in result["prompt"]
+        assert "模板:向量檢索/" in result["prompt"]
+        # 元件真的收到組好的兩則 messages(system + user)
+        assert "你是測試助理。 | 模板:向量檢索/" in result["answer"]
+
+    def test_custom_generator_reused_by_llm_transform(self, tmp_path, corpus_dir):
+        """params.generator 也吃 custom:整條 pipeline 只走公司的推論服務。"""
+        file = write_module(tmp_path, GENERATOR_OK)
+        config = parse_config(
+            make_config(
+                ingestion={
+                    "import": {
+                        "method": "local_file",
+                        "params": {
+                            "input_dir": str(corpus_dir),
+                            "extensions": [".txt"],
+                        },
+                    }
+                },
+                inference={
+                    "query_transformation": {
+                        "method": "llm_rewrite",
+                        "params": {
+                            "generator": {
+                                "method": "custom",
+                                "params": {"file": file, "class": "EchoGenerator"},
+                            }
+                        },
+                    },
+                    "reranking": {"method": "none"},
+                },
+            )
+        )
+        pipelines = build_pipelines(config)
+        rewriter = pipelines.inference.get_component("transform")
+        assert type(rewriter.chat_generator).__name__ == "EchoGenerator"
+
+    def test_wrong_shape_message_points_at_messages_socket(
+        self, tmp_path, corpus_dir
+    ):
+        file = write_module(tmp_path, GENERATOR_WRONG_SHAPE)
+        config = parse_config(
+            make_config(
+                inference={
+                    "generation": {
+                        "method": "custom",
+                        "params": {"file": file, "class": "NotAChatGenerator"},
+                    }
+                }
+            )
+        )
+        with pytest.raises(ConfigError) as excinfo:
+            build_pipelines(config)
+        message = str(excinfo.value)
+        assert "缺少輸入 socket 'messages" in message
+        assert "queries" in message  # 實際有什麼
 
 
 # ---------------------------------------------------------------------------
