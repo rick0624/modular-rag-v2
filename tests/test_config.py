@@ -71,6 +71,46 @@ class TestSchema:
             load_config(tmp_path / "nope.yaml", dotenv_path=None)
 
 
+class TestFusionCustomShape:
+    """fusion 的兩種寫法:內建扁平參數 × custom module,互斥。"""
+
+    @staticmethod
+    def _with_fusion(fusion):
+        data = make_config()
+        data["inference"]["fusion"] = fusion
+        return data
+
+    def test_custom_shape_parses(self):
+        config = parse_config(
+            self._with_fusion(
+                {"method": "custom", "params": {"file": "./f.py", "class": "F"}}
+            )
+        )
+        assert config.inference.fusion.method == "custom"
+        assert config.inference.fusion.params["class"] == "F"
+
+    def test_flat_shape_unchanged(self):
+        config = parse_config(self._with_fusion({"strategy": "max_score"}))
+        assert config.inference.fusion.method is None
+        assert config.inference.fusion.strategy == "max_score"
+
+    def test_mixing_custom_with_builtin_knobs_rejected(self):
+        with pytest.raises(ConfigError, match="請移除內建參數"):
+            parse_config(
+                self._with_fusion(
+                    {"method": "custom", "params": {"file": "./f.py"}, "top_k": 5}
+                )
+            )
+
+    def test_unknown_method_rejected(self):
+        with pytest.raises(ConfigError, match="只支援 'custom'"):
+            parse_config(self._with_fusion({"method": "rrf"}))
+
+    def test_params_without_method_rejected(self):
+        with pytest.raises(ConfigError, match="只搭配 method: custom"):
+            parse_config(self._with_fusion({"params": {"file": "./f.py"}}))
+
+
 class TestMethodParams:
     def test_method_params_block_wins_over_params(self):
         cfg = MethodConfig(

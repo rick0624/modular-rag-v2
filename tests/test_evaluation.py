@@ -169,6 +169,7 @@ class TestConfigFilesParse:
         from rag import builder
 
         for cfg, table in [
+            (config.ingestion.import_, builder.IMPORT_FACTORIES),
             (config.ingestion.parsing, builder.PARSING_FACTORIES),
             (config.ingestion.chunking, builder.CHUNKING_FACTORIES),
             (config.ingestion.embedding, builder.EMBEDDING_FACTORIES),

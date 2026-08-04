@@ -66,7 +66,7 @@ Evaluation: JSONL 測試集 → 逐題 RagPipelines.query() → hit_rate / MRR
 
 | 槽位 | 輸入 → 輸出 | 方法鏈 |
 |---|---|---|
-| import | (params)→ `sources: list[str]` + `meta: list[dict]` | ✗ |
+| import | (params)→ `sources: list[str \| Path \| ByteStream]` + `meta: list[dict]` | ✗ |
 | parsing | sources → `documents`(鏈首 converter,其餘 Document→Document)。鏈首可展開為**內部圖**(`auto`:FileTypeRouter → 多 converter → DocumentJoiner),對外契約不變 | ✓ |
 | chunking | documents → documents(splitter;`no_chunking` = 無節點) | ✗ |
 | embedding | factory 一次建 (document_embedder, text_embedder) 一對 | ✗ |
@@ -76,7 +76,7 @@ Evaluation: JSONL 測試集 → 逐題 RagPipelines.query() → hit_rate / MRR
 | reranking | documents(+query)→ documents;**只能重排/過濾/改分,不得改內容**(llm_fact_check 純過濾:順序與分數皆保留) | ✓ |
 | generation | ChatPromptBuilder 的 messages → `replies: [ChatMessage]`;`generate_answer: false` 時整段省略(此時 generation 區塊選填,僅作 LLM 沿用來源) | ✗ |
 | routing(選填槽位) | `query: str` → `route: dict[str, Any]`(圖上無下游;route 內容自由,慣例含 `category`) | ✗ |
-| fusion(內建步驟) | `list[list[Document]]` → `list[Document]`(非槽位,`inference.fusion` 設定) | — |
+| fusion(內建步驟,可換 custom) | `list[list[Document]]` → `list[Document]`(非槽位;`inference.fusion` 設定,`method: custom` 可換自訂元件 —— 掛上即一律執行) | — |
 
 ## 4. 相容性宣告(建構期檢查)
 
@@ -97,6 +97,12 @@ Evaluation: JSONL 測試集 → 逐題 RagPipelines.query() → hit_rate / MRR
    `IncrementalChangeFilter` 按 chunk_id 比對內容跳過 embedding)需要
    `incremental_update` 能力。檔案 manifest 帶 parse 設定雜湊,設定
    變更即作廢(全量重 parse)。
+
+宣告有靜態與動態兩型:內建方法用靜態欄位;custom 方法的宣告寫在
+config 參數裡(import 的 `content_type`、parsing 的 `kind` /
+`produces_pages` / `input_content_types`、chunking 的 `requires_pages`),
+builder 以 `_resolved_factory`(對應的 `*_fn` 欄位)在建構期解析成
+靜態欄位的複本 —— `compatibility.py` 的檢查因此完全不需要認識 custom。
 
 新增相容性維度:在 `SlotFactory` 加宣告欄位、`compatibility.py`
 補一條檢查即可。
@@ -119,6 +125,11 @@ custom 元件無宣告可查,建構期直接檢視
 | reranking | `query: str`、`documents: list[Document]` | `documents: list[Document]` |
 | routing | `query: str` | `route: dict[str, Any]` |
 | generation | `messages: list[ChatMessage]` | `replies: list[ChatMessage]` |
+| fusion | `results: list[list[Document]]` | `documents: list[Document]`(建議另輸出 `applied: bool`) |
+| import | (無;任何必填輸入都會被拒絕) | `sources: list[str \| Path \| ByteStream]`、`meta: list[dict[str, Any]]` |
+| parsing(`kind: doc_processor`,預設;契約鍵 `parsing`) | `documents: list[Document]` | `documents: list[Document]` |
+| parsing(`kind: converter`,鏈首;契約鍵 `parsing_converter`) | `sources`、`meta`(同 import 輸出) | `documents: list[Document]` |
+| chunking | `documents: list[Document]` | `documents: list[Document]` |
 
 驗證規則(不符 → `ConfigError`,訊息指明缺什麼、實際有什麼、怎麼改):
 
@@ -144,12 +155,24 @@ custom 元件無宣告可查,建構期直接檢視
   同等設成 DEBUG,所以 `getLogger(__name__)` 的紀錄進得了 log 檔;
   `class_path:` 載入的模組名不在框架掌握範圍,慣例是自己命名在
   `rag.custom.*` 底下(見 README「自訂方法」)。
+- **sources 的型別註記**:單一型別(`list[str]` / `list[ByteStream]`)
+  或**完整** union(`list[str | Path | ByteStream]`)都相容;部分 union
+  (如 `list[str | ByteStream]`)在 Haystack 的型別比對下不相容,會被
+  建構期擋下(訊息會給出正確寫法)。
+- **fusion 掛上即一律執行**(單一查詢也進元件,「單查詢穿透」由元件
+  自己決定);`applied` 是建議輸出,未回報時 trace 顯示三態的 None。
+- **import 的 meta 每筆必帶 `doc_id`**(socket 驗不到,執行期由
+  ChunkMetaStamper 兜底報錯);custom import 回傳非本地路徑時,
+  `incremental: true` 的檔案層增量退化為每次全量重 parse(出聲警告,
+  切片層增量不受影響)。
 - 其他槽位(embedding / indexing …)的 factory 回傳形狀不是單一元件
   (embedding 是 document / text 一對,indexing 是 document store),
   暫不支援 custom;需求出現時再為其設計契約。
 
 範例骨架:`examples/custom_modules/` + `configs/custom_demo.yaml`
-(有整合測試 `tests/test_custom_demo.py` 保證永遠可跑)。
+(inference 端 + fusion)與 `configs/custom_ingestion_demo.yaml`
+(ingestion 三槽位),各有整合測試(`tests/test_custom_demo.py` /
+`tests/test_custom_ingestion_demo.py`)保證永遠可跑。
 
 ## 5. 服務模式不變量(`rag/service.py` + `rag/kb_meta.py`)
 
@@ -157,9 +180,11 @@ custom 元件無宣告可查,建構期直接檢視
   對「展開前」的原始 config dict 取 `{ingestion, haystack_pipelines.ingestion}`
   區塊,`json.dumps(sort_keys=True)` 後 sha256。展開前計算 →
   `${ENV_VAR}` 機密不進雜湊;解析後的 dict → 註解 / 排版 / anchor
-  重構不影響。已知盲區:env var **值**的輪替、escape-hatch pipeline
-  檔的內容變更、custom module **.py 檔內容**的變更(config 中的
-  file / class_path 路徑有進指紋,檔案內容沒有;inference 端的 custom
+  重構不影響。**ingestion 端 custom module 的 `file:` 檔案內容一併進
+  指紋與檔案層 manifest 的作廢鍵**(改了解析 / 切塊邏輯 = 索引過期,
+  /reload 409、增量全量重 parse)。已知盲區:env var **值**的輪替、
+  escape-hatch pipeline 檔的內容變更、`class_path:` 指向的套件內容
+  (只有路徑字串進指紋)、inference 端 custom 的檔案內容(刻意排除:
   以 `/reload` 重載即可生效 —— 每次建構都重新 exec 檔案)。
 - 指紋**排除操作性欄位**:`indexing` 的 `incremental` 與連線憑證 / TLS
   (`api_key` / `username` / `password` / `ca_certs` / `verify_certs`)——

@@ -16,14 +16,24 @@
 
 ingestion:
   import:
-    method: local_file              # 唯一方法:萬用 importer(txt / md / pdf)
+    method: local_file              # 可選:local_file / custom
     method_params:
-      local_file:
+      local_file:                   # 萬用 importer(txt / md / pdf)
         input_dir: ./data/raw       # 必填:要匯入的資料夾
         # extensions: [".txt", ".md", ".pdf"]   # 預設:三者全收
         #   收窄成同質型別(全文字或全 PDF)後,才能搭配單型別 parser
         #   (plain_text / pdf);混合型別只有 auto 能接。
         # recursive: true           # 預設 true:含子資料夾
+      custom:                       # 自訂來源(公司 DMS / API;示範見
+        #                           #   configs/custom_ingestion_demo.yaml)
+        # 契約:無輸入 → sources(路徑或 ByteStream)+ meta(必帶 doc_id)
+        file: ./my_importer.py      # 或 class_path: "pkg.mod:Class"
+        class: MyImporter
+        # content_type: text        # 預設 None = 跳過與 parsing 的相容性檢查;
+        #                           #   可宣告 text / pdf / mixed
+        # init_params: {}           # 預設 {}:透傳給元件建構子
+        # 注意:sources 非本地路徑時,incremental: true 的檔案層增量會
+        # 退化為每次全量重 parse;.py 檔內容會進 ingestion 指紋
 
   parsing:
     # 可選:auto / plain_text / pdf;鏈(輸出同型可串):[auto, clean]
@@ -46,9 +56,19 @@ ingestion:
         remove_empty_lines: true    # 預設 true
         remove_extra_whitespaces: true  # 預設 true
         # remove_repeated_substrings: false  # 預設 false:去除頁首頁尾重複段
+      custom:                       # 自訂解析 / 前處理(兩種位置,契約不同)
+        # 鏈中(預設 kind: doc_processor):documents → documents
+        # 鏈首(kind: converter):sources + meta → documents
+        file: ./my_parser.py        # 或 class_path: "pkg.mod:Class"
+        class: MyParser
+        # kind: doc_processor       # 預設;放鏈首必須設 converter
+        # produces_pages: false     # 預設 false;產生頁界時設 true
+        #                           #   (page_based chunking 的前提)
+        # input_content_types: [text]   # 預設 None = 全收;僅 converter 可設
+        # init_params: {}           # 預設 {};.py 檔內容會進 ingestion 指紋
 
   chunking:
-    # 可選:fixed_size / structure_based / page_based / no_chunking
+    # 可選:fixed_size / structure_based / page_based / no_chunking / custom
     method: fixed_size
     method_params:
       fixed_size:                   # 固定長度(字元),\f/段落/行邊界優先
@@ -61,6 +81,12 @@ ingestion:
       page_based:                   # 按頁切(需要會產生分頁的 parser:pdf / auto)
         pages_per_chunk: 1          # 預設 1
       no_chunking: {}               # 整份文件一個切片(無參數)
+      custom:                       # 自訂切塊(公司切塊規則)
+        # 契約:documents → documents(meta 逐塊複製,doc_id 必須保留)
+        file: ./my_chunker.py       # 或 class_path: "pkg.mod:Class"
+        class: MyChunker
+        # requires_pages: false     # 預設 false;需要頁界輸入時設 true
+        # init_params: {}           # 預設 {};.py 檔內容會進 ingestion 指紋
 
   embedding:
     # 可選:mock / sentence_transformers / api_embedding
@@ -262,6 +288,14 @@ inference:
   #   group_by: doc                 # 預設 none;可選 none / doc / page
   #   strategy: rrf                 # 預設 rrf;可選 rrf / concat_dedup / max_score
   #   top_k: 5                      # 預設 5
+  # fusion:                         # 或:自訂融合(公司融合邏輯;與內建參數互斥)
+  #   method: custom                # 契約:results: list[list[Document]]
+  #   params:                       #      → documents: list[Document]
+  #     file: ./my_fusion.py        # 或 class_path: "pkg.mod:Class"
+  #     class: MyFusion
+  #     # init_params: {}           # 預設 {}
+  #   # 注意:掛了 custom 就一律執行(單一查詢也進元件,原樣通過與否
+  #   # 由元件決定);建議額外輸出 applied: bool 供 trace 區分
 
   # routing:                        # 選填:查詢分類(獨立支線,不影響檢索;
   #                                 # 結果附加於輸出的 routing key 與 trace)

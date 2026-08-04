@@ -56,6 +56,16 @@ def test_custom_demo_end_to_end(corpus_dir, monkeypatch):
     # prompt 仍由框架組:YAML 的 system_prompt 有進去
     assert "你是公司內部知識庫的助理" in result["prompt"]
 
+    # custom fusion:一律執行(applied 由骨架回報)且 RRF 標記進 meta
+    fusion = pipelines.inference.get_component("fusion")
+    assert type(fusion).__name__ == "CompanyFusion"
+    assert result["trace"]["fusion"]["applied"] is True
+    assert all("num_merged" in doc.meta for doc in documents)
+
+    # custom parsing(鏈中文件處理器):cleaner 掛在 parser 之後
+    parser_2 = pipelines.ingestion.get_component("parser_2")
+    assert type(parser_2).__name__ == "CompanyBoilerplateCleaner"
+
     lines = format_query_trace(result["trace"])
     joined = "\n".join(lines)
     assert "Routing" in joined

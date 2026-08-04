@@ -125,10 +125,19 @@ def format_query_trace(trace: dict[str, Any], limit: int = 5) -> list[str]:
             previous = documents
 
     fused = trace["fusion"]["documents"]
+    applied = trace["fusion"]["applied"]
     lines.append("")
-    if trace["fusion"]["applied"]:
+    if applied:
         lines.append("--- Fusion(去重 / 聚合 / 排序)---")
         lines.append(f"  → {len(fused)} 筆")
+    elif applied is None:
+        # custom fusion 一律執行,但 applied 只是建議輸出 —— 元件沒回報時
+        # 講明「執行過、內容未知」,不猜測它做了什麼。
+        lines.append("--- Fusion(custom 元件)---")
+        lines.append(
+            f"  → {len(fused)} 筆(custom fusion 一律執行;元件未回報 applied "
+            "旗標 —— 建議在 @component.output_types 加上 applied: bool)"
+        )
     else:
         # 元件恆存在於 pipeline,但單一查詢且 config 未設 fusion 時不做事;
         # 不講明的話,紀錄裡出現 fusion 會讓人以為結果被重排過。

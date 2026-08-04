@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import logging
 from dataclasses import dataclass, field as dc_field
@@ -106,7 +107,7 @@ class SlotFactory:
     build: Callable[[dict[str, Any], "BuildContext"], Any]
     kind: str = ""  # parsing 鏈用:"converter"(檔案→Document)/ "doc_processor"
     output_content_type: str | None = None  # import 槽位宣告(靜態)
-    output_content_type_fn: Callable[[dict[str, Any]], str] | None = None
+    output_content_type_fn: Callable[[dict[str, Any]], str | None] | None = None
     """import 槽位宣告(動態):依方法參數推導 content_type(如 local_file
     依 extensions 推導 text / pdf / mixed);設定時優先於靜態宣告。"""
     input_content_types: frozenset[str] = frozenset()  # parsing 槽位宣告
@@ -114,6 +115,32 @@ class SlotFactory:
     requires_pages: bool = False  # chunking 槽位宣告
     capabilities: frozenset[str] = frozenset()  # indexing 槽位宣告
     required_capabilities: frozenset[str] = frozenset()  # retrieval 槽位宣告
+
+    # 動態宣告(custom 方法用):相容性欄位寫在 config 參數裡,建構期以
+    # :func:`_resolved_factory` 解析成靜態欄位的複本 —— 鏈驗證與
+    # compatibility 檢查因此完全不需要認識 custom。與 output_content_type_fn
+    # 同一先例,設定時優先於對應的靜態欄位。
+    kind_fn: Callable[[dict[str, Any]], str] | None = None
+    produces_pages_fn: Callable[[dict[str, Any]], bool] | None = None
+    input_content_types_fn: Callable[[dict[str, Any]], frozenset[str]] | None = None
+    requires_pages_fn: Callable[[dict[str, Any]], bool] | None = None
+
+
+def _resolved_factory(factory: SlotFactory, params: dict[str, Any]) -> SlotFactory:
+    """把 factory 的動態宣告(``*_fn``)依方法參數解析成靜態欄位複本。
+
+    非 custom 方法沒有設定任何 ``*_fn``,原樣返回(零成本)。
+    """
+    updates: dict[str, Any] = {}
+    if factory.kind_fn is not None:
+        updates["kind"] = factory.kind_fn(params)
+    if factory.produces_pages_fn is not None:
+        updates["produces_pages"] = factory.produces_pages_fn(params)
+    if factory.input_content_types_fn is not None:
+        updates["input_content_types"] = factory.input_content_types_fn(params)
+    if factory.requires_pages_fn is not None:
+        updates["requires_pages"] = factory.requires_pages_fn(params)
+    return dataclasses.replace(factory, **updates) if updates else factory
 
 
 @dataclass
@@ -565,6 +592,26 @@ def _build_elasticsearch_store(raw: dict[str, Any], ctx: BuildContext) -> Any:
     return ElasticsearchDocumentStore(**kwargs)
 
 
+class _CustomImportParams(CustomModuleParams):
+    """``import: method: custom`` 的參數:custom module 定位 + content_type 宣告。"""
+
+    content_type: Literal["text", "pdf", "mixed"] | None = Field(
+        default=None,
+        description="元件輸出的 content_type 宣告,供建構期與 parsing 的相容性"
+        "檢查;None = 跳過檢查(元件輸出的型態由你自行保證)",
+    )
+
+
+def _build_custom_import(raw: dict[str, Any], ctx: BuildContext) -> Any:
+    p = _validate_params("import", "custom", _CustomImportParams, raw)
+    return instantiate_custom("import", p)
+
+
+def _custom_import_output_type(raw: dict[str, Any]) -> str | None:
+    p = _validate_params("import", "custom", _CustomImportParams, raw)
+    return p.content_type
+
+
 IMPORT_FACTORIES: dict[str, SlotFactory] = {
     # 萬用 importer:txt / md / pdf 都收(可用 extensions 收窄);
     # content_type 依 extensions 推導,混合型別時 parsing 需用 auto 分流。
@@ -572,7 +619,71 @@ IMPORT_FACTORIES: dict[str, SlotFactory] = {
         build=_make_file_lister_builder("local_file", _LOCAL_FILE_DEFAULT_EXTENSIONS),
         output_content_type_fn=_local_file_output_type,
     ),
+    # 契約:無輸入 → sources + meta(meta 每筆必帶 doc_id)。
+    # sources 可以是路徑或 ByteStream(公司 API 直接回內容時);
+    # 非路徑 sources 搭配 incremental 時檔案層增量會退化為全量重 parse。
+    "custom": SlotFactory(
+        build=_build_custom_import,
+        output_content_type_fn=_custom_import_output_type,
+    ),
 }
+
+# parsing 的 content_type 全集:custom converter 未宣告 input_content_types
+# 時的預設(封閉 Literal 之下,「全收」與「跳過檢查」同義)。
+_ALL_CONTENT_TYPES = frozenset(set(_EXTENSION_CONTENT_TYPES.values()) | {"mixed"})
+
+
+class _CustomParsingParams(CustomModuleParams):
+    """``parsing: method: custom`` 的參數:custom module 定位 + 鏈位置宣告。"""
+
+    kind: Literal["converter", "doc_processor"] = Field(
+        default="doc_processor",
+        description="鏈位置:converter = 鏈首(sources + meta → documents);"
+        "doc_processor = 鏈中 / 鏈尾(documents → documents,預設)",
+    )
+    produces_pages: bool = Field(
+        default=False,
+        description="元件是否產生頁界資訊(page_based chunking 的前提;"
+        "兩種 kind 都可宣告)",
+    )
+    input_content_types: list[Literal["text", "pdf", "mixed"]] | None = Field(
+        default=None,
+        description="converter 可處理的 content_type(供與 import 的相容性檢查);"
+        "None = 全收。僅 kind: converter 可設定",
+    )
+
+    @model_validator(mode="after")
+    def _content_types_only_for_converter(self) -> "_CustomParsingParams":
+        if self.kind != "converter" and self.input_content_types is not None:
+            raise ValueError(
+                "input_content_types 只對 kind: converter 有意義"
+                "(doc_processor 收的是上游的 documents,不接觸原始檔案)"
+            )
+        return self
+
+
+def _build_custom_parsing(raw: dict[str, Any], ctx: BuildContext) -> Any:
+    p = _validate_params("parsing", "custom", _CustomParsingParams, raw)
+    contract = "parsing_converter" if p.kind == "converter" else "parsing"
+    return instantiate_custom("parsing", p, contract=contract)
+
+
+def _custom_parsing_kind(raw: dict[str, Any]) -> str:
+    return _validate_params("parsing", "custom", _CustomParsingParams, raw).kind
+
+
+def _custom_parsing_produces_pages(raw: dict[str, Any]) -> bool:
+    return _validate_params(
+        "parsing", "custom", _CustomParsingParams, raw
+    ).produces_pages
+
+
+def _custom_parsing_input_types(raw: dict[str, Any]) -> frozenset[str]:
+    p = _validate_params("parsing", "custom", _CustomParsingParams, raw)
+    if p.input_content_types is None:
+        return _ALL_CONTENT_TYPES
+    return frozenset(p.input_content_types)
+
 
 PARSING_FACTORIES: dict[str, SlotFactory] = {
     "plain_text": SlotFactory(
@@ -595,13 +706,49 @@ PARSING_FACTORIES: dict[str, SlotFactory] = {
         produces_pages=True,
     ),
     "clean": SlotFactory(build=_build_clean, kind="doc_processor"),
+    # 契約依 kind 而異:converter(鏈首)= sources + meta → documents;
+    # doc_processor(鏈中,預設)= documents → documents。
+    "custom": SlotFactory(
+        build=_build_custom_parsing,
+        kind_fn=_custom_parsing_kind,
+        produces_pages_fn=_custom_parsing_produces_pages,
+        input_content_types_fn=_custom_parsing_input_types,
+    ),
 }
+
+
+class _CustomChunkingParams(CustomModuleParams):
+    """``chunking: method: custom`` 的參數:custom module 定位 + 分頁需求宣告。"""
+
+    requires_pages: bool = Field(
+        default=False,
+        description="元件是否需要分頁輸入(供與 parsing 鏈的相容性檢查:"
+        "true 時 parsing 鏈必須產生頁界)",
+    )
+
+
+def _build_custom_chunking(raw: dict[str, Any], ctx: BuildContext) -> Any:
+    p = _validate_params("chunking", "custom", _CustomChunkingParams, raw)
+    return instantiate_custom("chunking", p)
+
+
+def _custom_chunking_requires_pages(raw: dict[str, Any]) -> bool:
+    return _validate_params(
+        "chunking", "custom", _CustomChunkingParams, raw
+    ).requires_pages
+
 
 CHUNKING_FACTORIES: dict[str, SlotFactory] = {
     "fixed_size": SlotFactory(build=_build_fixed_size),
     "structure_based": SlotFactory(build=_build_structure_based),
     "page_based": SlotFactory(build=_build_page_based, requires_pages=True),
     "no_chunking": SlotFactory(build=_build_no_chunking),
+    # 契約:documents → documents(meta 逐塊繼承,doc_id 必須保留 ——
+    # 下游 stamper 依 doc_id 產生穩定 chunk_id)。
+    "custom": SlotFactory(
+        build=_build_custom_chunking,
+        requires_pages_fn=_custom_chunking_requires_pages,
+    ),
 }
 
 EMBEDDING_FACTORIES: dict[str, SlotFactory] = {
@@ -634,9 +781,17 @@ INDEXING_FACTORIES: dict[str, SlotFactory] = {
 
 
 def _build_parsing_chain(cfg: MethodConfig) -> tuple[list[str], list[SlotFactory]]:
-    """解析 parsing 方法鏈:鏈首必須是 converter,其餘必須是文件處理器。"""
+    """解析 parsing 方法鏈:鏈首必須是 converter,其餘必須是文件處理器。
+
+    回傳的 factories 已經過 :func:`_resolved_factory`(custom 的 kind /
+    produces_pages / input_content_types 從 config 參數解析成靜態欄位),
+    呼叫端可直接讀宣告欄位。
+    """
     methods = cfg.methods()
-    factories = [_resolve("parsing", PARSING_FACTORIES, m) for m in methods]
+    factories = [
+        _resolved_factory(_resolve("parsing", PARSING_FACTORIES, m), cfg.params_for(m))
+        for m in methods
+    ]
     if factories[0].kind != "converter":
         converters = [
             name for name, f in PARSING_FACTORIES.items() if f.kind == "converter"
@@ -644,13 +799,15 @@ def _build_parsing_chain(cfg: MethodConfig) -> tuple[list[str], list[SlotFactory
         listed = ", ".join(repr(n) for n in sorted(converters))
         raise ConfigError(
             f"parsing 鏈的第一個方法必須是 converter(檔案 → Document),"
-            f"但 '{methods[0]}' 不是。請把 {listed} 之一放在鏈首"
+            f"但 '{methods[0]}' 不是。請把 {listed} 之一放在鏈首;"
+            "custom 方法要放鏈首時,在其參數設 kind: converter"
         )
     for position, (method, factory) in enumerate(zip(methods, factories)):
         if position > 0 and factory.kind != "doc_processor":
             raise ConfigError(
                 f"parsing 鏈的第 {position + 1} 個方法 '{method}' 是 converter;"
-                "converter 只能放在鏈首,後續環節必須是文件處理器(如 'clean')"
+                "converter 只能放在鏈首,後續環節必須是文件處理器(如 'clean';"
+                "custom 方法預設 kind: doc_processor 即可放鏈中)"
             )
     return methods, factories
 
@@ -714,7 +871,10 @@ def build_ingestion_pipeline(
     chain_produces_pages = any(f.produces_pages for f in parse_factories)
 
     chunking_method = _require_single("chunking", ing.chunking)
-    chunking_factory = _resolve("chunking", CHUNKING_FACTORIES, chunking_method)
+    chunking_factory = _resolved_factory(
+        _resolve("chunking", CHUNKING_FACTORIES, chunking_method),
+        ing.chunking.params_for(chunking_method),
+    )
     validate_chunking_compatibility(
         parse_methods, chain_produces_pages, chunking_method, chunking_factory,
         PARSING_FACTORIES, CHUNKING_FACTORIES,
@@ -1508,15 +1668,21 @@ def build_inference_pipeline(
     )
 
     fusion_cfg = inf.fusion or FusionConfig()
-    outer.add_component(
-        "fusion",
-        SubqueryFusion(
+    if fusion_cfg.method == "custom":
+        # 掛上即一律執行:單一查詢的 N=1 也進元件,原樣通過與否由元件
+        # 自己決定(建議額外輸出 applied: bool 供 trace 區分)。
+        fusion_params = _validate_params(
+            "fusion", "custom", CustomModuleParams, fusion_cfg.params
+        )
+        fusion_component: Any = instantiate_custom("fusion", fusion_params)
+    else:
+        fusion_component = SubqueryFusion(
             group_by=fusion_cfg.group_by,
             strategy=fusion_cfg.strategy,
             top_k=fusion_cfg.top_k,
             always_fuse=inf.fusion is not None,
-        ),
-    )
+        )
+    outer.add_component("fusion", fusion_component)
     outer.connect("multi_query.results", "fusion.results")
 
     # routing:獨立支線 —— 吃原始查詢(query() 直接餵,如同 prompt_builder
@@ -1698,7 +1864,9 @@ class RagPipelines:
                   "transforms": [{component, type, queries}],   # 每段改寫後的查詢
                   "routing": {category, ...} | None,            # 查詢分類(獨立支線)
                   "subqueries": [{query, steps: [{component, type, documents}]}],
-                  "fusion": {documents},                        # 融合 / 去重後
+                  "fusion": {documents, applied},               # 融合 / 去重後
+                                                # applied 三態:True 融合過 /
+                                                # False 內建穿透 / None custom 未回報
                   "generation": {prompt, answer, meta} | None,
                 }
 
@@ -1766,8 +1934,10 @@ class RagPipelines:
                 "subqueries": result["multi_query"].get("traces", []),
                 "fusion": {
                     "documents": result["fusion"]["documents"],
-                    # False = 元件只是穿透(單一查詢且 config 未設 fusion)
-                    "applied": result["fusion"].get("applied", False),
+                    # 三態:True = 融合過;False = 內建穿透(單一查詢且
+                    # config 未設 fusion);None = custom 元件未回報
+                    # (custom fusion 一律執行,applied 是建議輸出)
+                    "applied": result["fusion"].get("applied"),
                 },
                 "generation": (
                     {"prompt": prompt_text, "answer": answer, "meta": reply_meta}
