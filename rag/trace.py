@@ -89,6 +89,17 @@ def format_query_trace(trace: dict[str, Any], limit: int = 5) -> list[str]:
         lines.append(f"  [{step}] {entry['component']} ({entry['type']})")
         lines.extend(f"      → {query!r}" for query in entry["queries"])
 
+    # routing:獨立支線(吃原始查詢,不影響檢索)。用 .get:舊版 trace
+    # dict(無 routing key)也要能排版。
+    route = trace.get("routing")
+    if route is not None:
+        lines.append("")
+        lines.append("--- Routing(查詢分類;不影響檢索)---")
+        category = route.get("category")
+        rest = {k: v for k, v in route.items() if k != "category"}
+        detail = f" {rest}" if rest else ""
+        lines.append(f"  → category={category!r}{detail}")
+
     subqueries = trace["subqueries"]
     for index, sub in enumerate(subqueries, start=1):
         lines.append("")

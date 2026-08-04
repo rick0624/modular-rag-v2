@@ -65,6 +65,7 @@ class QueryResponse(BaseModel):
     documents: list[DocumentOut]
     subquery_count: int
     prompt: str | None
+    routing: dict[str, Any] | None = None  # 查詢分類;未設 routing 槽位時為 null
 
 
 class IngestStep(BaseModel):
@@ -215,6 +216,7 @@ def create_app(config_path: str | Path, *, skip_ingest: bool = False) -> Any:
             ],
             subquery_count=len(result["subquery_results"]),
             prompt=result["prompt"],
+            routing=result.get("routing"),
         )
 
     @app.post("/ingest", response_model=IngestResponse)
@@ -273,6 +275,7 @@ def create_app(config_path: str | Path, *, skip_ingest: bool = False) -> Any:
                 query_entry=meta["query_entry"],
                 generate_answer=meta["generate_answer"],
                 transform_names=meta["transform_names"],
+                routing_enabled=meta["routing_enabled"],
             )
         logger.info("inference 設定重載完成")
         return ReloadResponse(status="reloaded", fingerprint=state.fingerprint)

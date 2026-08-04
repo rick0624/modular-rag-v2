@@ -16,6 +16,7 @@
 Ingestion:  Import → Parsing → Chunking → (身分蓋章) → Embedding → Indexing
 Inference:  查詢 → Query Transformation 鏈 → 多子查詢檢索(檢索 → 重排)
             → 融合/聚合 → Prompt → Generation
+            └→ Routing(選填獨立支線:查詢分類,結果附加於輸出)
 Evaluation: JSONL 測試集 → 逐題查詢 → hit rate / MRR
 ```
 
@@ -26,12 +27,17 @@ Evaluation: JSONL 測試集 → 逐題查詢 → hit rate / MRR
 | chunking | **fixed_size** / structure_based / page_based / no_chunking | (Recursive)DocumentSplitter,一律字元單位 |
 | embedding | **mock** / sentence_transformers / api_embedding | ST 整合套件 / 自訂 Flexible API embedder |
 | indexing | **in_memory** / elasticsearch(皆支援 `incremental: true` 增量 ingest) | InMemory / Elasticsearch DocumentStore |
-| query_transformation | **normalize** / passthrough / glossary / jargon_mapping / llm_rewrite / llm_decompose | 自訂元件(`list[str] → list[str]`) |
-| retrieval | **bm25** / embedding / hybrid(皆支援 `boost_k_factor` 候選放大) | 依 indexing 選 retriever;hybrid 走 RRF |
-| reranking | **none** / similarity / api_rerank / llm / llm_fact_check | ST cross-encoder / 自訂 Flexible API ranker / core LLMRanker / 自訂 LLMFactChecker |
+| query_transformation | **normalize** / passthrough / glossary / jargon_mapping / llm_rewrite / llm_decompose / custom | 自訂元件(`list[str] → list[str]`) |
+| retrieval | **bm25** / embedding / hybrid(皆支援 `boost_k_factor` 候選放大) / custom | 依 indexing 選 retriever;hybrid 走 RRF |
+| reranking | **none** / similarity / api_rerank / llm / llm_fact_check / custom | ST cross-encoder / 自訂 Flexible API ranker / core LLMRanker / 自訂 LLMFactChecker |
 | generation | **mock** / openai / gateway_openai_compatible(`generate_answer: false` 可跳過) | OpenAIChatGenerator / 自訂閘道 generator |
+| routing(選填槽位,省略=不做) | keyword_match / custom | 自訂 KeywordRouteClassifier;結果進 `query()` 的 `routing` key,不影響檢索 |
 | fusion(內建步驟) | rrf / concat_dedup / max_score × group_by none/doc/page | 自訂 SubqueryFusion(v1 演算法) |
 | evaluation | basic_retrieval_metrics | hit rate / MRR(doc_id 依名次去重) |
+
+`custom` 方法讓你把**自己的 Haystack 元件 .py 檔**掛進槽位,零框架改動
+接入公司系統(見下方「如何新增一個自訂方法」與
+[configs/custom_demo.yaml](configs/custom_demo.yaml))。
 
 方法組合的相容性(content_type、分頁需求、索引能力)在**建構期**檢查,
 不合法組合直接報錯並列出可相容的方法,詳見
@@ -227,6 +233,7 @@ result = pipelines.query("FAISS 支援哪些索引結構?")
 result["answer"]      # 回答
 result["documents"]   # 融合後切片(meta 含 doc_id/page/group_key/sources)
 result["prompt"]      # 實際送出的 prompt(可稽核)
+result["routing"]     # 查詢分類結果(未設 routing 槽位時為 None)
 ```
 
 ## 服務模式(HTTP API)
@@ -345,9 +352,12 @@ haystack_pipelines:
 
 ## 如何新增一個自訂方法
 
-三步驟,以「依句號切分查詢的 transform」為例:
+兩條路:**custom module**(路 A,推薦 —— 零框架改動,程式碼留在你自己
+的 repo)與**進框架型錄**(路 B —— 改 builder.py,成為所有人可選的方法)。
 
-**1. 寫一個 Haystack 元件**(或直接用現成元件,跳到第 2 步):
+### 路 A:custom module(`method: custom`)
+
+**1. 寫一個 Haystack 元件 .py 檔**(放哪都行,例:`my_transform.py`):
 
 ```python
 from haystack import component
@@ -362,7 +372,53 @@ class BySentenceSplitter:
         return {"queries": out}
 ```
 
-**2. 在 `rag/builder.py` 寫 factory 並加進對映表**:
+**2. 在 YAML 掛進槽位**:
+
+```yaml
+  query_transformation:
+    method: custom
+    params:
+      file: ./my_transform.py       # 路徑相對「執行目錄」,不是 config 檔位置
+      class: BySentenceSplitter
+      # init_params: {...}          # 透傳給元件建構子
+```
+
+已安裝成套件的元件改用 `class_path: "my_pkg.transforms:BySentenceSplitter"`
+(與 `file` 擇一,不需要 `class`)。
+
+支援 custom 的槽位與 **socket 契約**(建構期驗證,不符直接報錯並指明修法):
+
+| 槽位 | 輸入 sockets | 輸出 sockets |
+|---|---|---|
+| query_transformation | `queries: list[str]` | `queries: list[str]` |
+| retrieval | `query: str` | `documents: list[Document]` |
+| reranking | `query: str` + `documents: list[Document]` | `documents: list[Document]` |
+| routing | `query: str` | `route: dict[str, Any]` |
+
+規則與慣例:
+
+- **額外的輸出 socket 允許**(自動收進 trace);**額外的必填輸入不允許**
+  (執行期沒有上游會餵它)—— 需要設定值就給預設值或走 `init_params`。
+- **外部欄位映射進 Document 是元件內部的責任**:外部系統的回應
+  (如 `{dockey, score, contentTitle, contentChunk}`)在 custom retrieval
+  內轉成 `Document`(內文 → `content`、分數 → `score`、其餘 → `meta`),
+  出了槽位邊界只流框架的 canonical 型別。建議一併補 `meta["doc_id"]` 與
+  `meta["chunk_id"]`,trace 標籤、fusion `group_by: doc` 與 evaluation
+  才能直接運作。
+- custom 可出現在方法鏈中(`method: [normalize, custom]`),但同一條鏈
+  只能有一個 `custom`(需要兩個時把邏輯合併成一個元件,或走路 B)。
+- generation / embedding / indexing 等其他槽位暫不支援 custom(factory
+  回傳形狀不是單一元件);有需求時走路 B。
+- 完整可跑的骨架見 [examples/custom_modules/](examples/custom_modules/)
+  (公司檢索 / 重排 / 分類三支,`TODO(替換點)` 標明換入真實邏輯的位置)
+  與 [configs/custom_demo.yaml](configs/custom_demo.yaml):
+  `python scripts/run_demo.py --config configs/custom_demo.yaml --trace`
+- 注意:custom module 就是執行任意 Python 程式碼,與 config 檔同一
+  信任層級,只載入你信任的來源。
+
+### 路 B:進框架型錄(改 `rag/builder.py`)
+
+**1. 寫元件**(同上)。**2. 寫 factory 並加進對映表**:
 
 ```python
 class _BySentenceParams(BaseParams):   # extra="forbid":打錯參數直接報錯
@@ -375,12 +431,7 @@ def _build_by_sentence(raw, ctx):
 TRANSFORM_FACTORIES["by_sentence"] = SlotFactory(build=_build_by_sentence)
 ```
 
-**3. 在 YAML 改 `method`**:
-
-```yaml
-  query_transformation:
-    method: by_sentence
-```
+**3. 在 YAML 改 `method: by_sentence`**。
 
 其他槽位作法相同;有相容性需求時在 `SlotFactory` 上宣告
 (`requires_pages`、`required_capabilities` 等),builder 會自動檢查。

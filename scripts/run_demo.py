@@ -129,6 +129,8 @@ def main() -> None:
     subqueries = len(result["subquery_results"])
     extra = f",{subqueries} 個子查詢" if subqueries > 1 else ""
     print(f"\n查詢:{args.query}{extra}")
+    if result.get("routing") is not None:
+        print(f"查詢分類:{result['routing']}")
     if not result["documents"]:
         print("(無檢索結果 —— 逐步經過看 log 檔或加 --trace)")
     for rank, doc in enumerate(result["documents"], start=1):

@@ -1,0 +1,69 @@
+# Custom module 示範配置:retrieval / reranking / routing 三個槽位都掛
+# examples/custom_modules/ 下的自訂元件(公司系統整合的骨架)。
+#
+# 完全離線可跑(mock embedding + in_memory + mock 生成):
+#
+#   python scripts/run_demo.py --config configs/custom_demo.yaml --trace
+#
+# 注意:custom module 的 file 路徑相對於「執行目錄」(repo 根)解析,
+# 不是 config 檔的位置。到公司整合時,把三支 .py 裡標了
+# 「TODO(替換點)」的函式換成真正的邏輯即可,其餘串接不用動。
+
+ingestion:
+  # custom retrieval 不查本地索引(範例直接回模擬資料;正式版走公司 ES
+  # 的 HTTP API),但 config 仍需 ingestion 區塊提供 embedding / indexing
+  # 設定(建構期的 BuildContext 依賴)。這裡用全離線的最小組合;
+  # 語料實際上不會被 custom retrieval 用到。
+  import:
+    method: local_file
+    params:
+      input_dir: ./data/raw
+      extensions: [".txt", ".md"]
+  parsing:
+    method: plain_text
+  chunking:
+    method: fixed_size
+    params:
+      split_length: 300
+      split_overlap: 50
+  embedding:
+    method: mock
+    params:
+      dim: 32
+  indexing:
+    method: in_memory
+
+inference:
+  query_transformation:
+    method: normalize
+
+  retrieval:
+    method: custom                  # 契約:query: str → documents: list[Document]
+    params:
+      file: examples/custom_modules/company_retrieval.py
+      class: CompanyRetriever
+      init_params:
+        top_k: 5
+        # endpoint: https://km.example.com/api/search   # 接真服務時設定
+
+  reranking:
+    method: custom                  # 契約:query + documents → documents
+    params:
+      file: examples/custom_modules/company_reranker.py
+      class: KeywordOverlapReranker
+      init_params:
+        top_k: 3
+
+  routing:                          # 獨立支線:判斷類別,不影響檢索
+    method: custom                  # 契約:query: str → route: dict
+    params:
+      file: examples/custom_modules/company_router.py
+      class: CompanyQuestionRouter
+      # init_params:
+      #   rules:                    # 不設定時用範例內建規則
+      #     人資/差勤: [請假, 特休, 薪資]
+      #   default_category: 其他
+
+  generation:
+    method: mock                    # 離線假答案;接公司 LLM 閘道時換
+                                    # gateway_openai_compatible(見 company.yaml)

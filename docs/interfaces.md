@@ -57,6 +57,9 @@ Inference:  query:str → query_transformation 鏈(list[str] → list[str])
             → list[list[Document]] → SubqueryFusion → list[Document]
             → ChatPromptBuilder → chat generator → replies
             (generate_answer: false 時圖止於 SubqueryFusion,檢索-only)
+            └→ routing(選填獨立支線):query:str → route: dict
+               吃「原始」查詢(不經 transform 鏈)、圖上無下游;
+               結果附加於 query() 回傳的 routing key 與 trace,不影響檢索
 
 Evaluation: JSONL 測試集 → 逐題 RagPipelines.query() → hit_rate / MRR
 ```
@@ -72,6 +75,7 @@ Evaluation: JSONL 測試集 → 逐題 RagPipelines.query() → hit_rate / MRR
 | retrieval | 展開為內部圖(retriever[s] + joiner),輸出 documents;`boost_k_factor` 放大候選為 top_k × factor | ✗ |
 | reranking | documents(+query)→ documents;**只能重排/過濾/改分,不得改內容**(llm_fact_check 純過濾:順序與分數皆保留) | ✓ |
 | generation | ChatPromptBuilder 的 messages → `replies: [ChatMessage]`;`generate_answer: false` 時整段省略(此時 generation 區塊選填,僅作 LLM 沿用來源) | ✗ |
+| routing(選填槽位) | `query: str` → `route: dict[str, Any]`(圖上無下游;route 內容自由,慣例含 `category`) | ✗ |
 | fusion(內建步驟) | `list[list[Document]]` → `list[Document]`(非槽位,`inference.fusion` 設定) | — |
 
 ## 4. 相容性宣告(建構期檢查)
@@ -97,6 +101,42 @@ Evaluation: JSONL 測試集 → 逐題 RagPipelines.query() → hit_rate / MRR
 新增相容性維度:在 `SlotFactory` 加宣告欄位、`compatibility.py`
 補一條檢查即可。
 
+## 4b. custom module 契約(`rag/contracts.py` + `rag/custom.py`)
+
+`method: custom` 把使用者自寫的 Haystack `@component` 掛進槽位
+(config 以 `class_path: "pkg.mod:Class"` 或 `file` + `class` 指定,
+`init_params` 透傳建構子)。與 §4 的分工:§4 檢查「方法組合的語意」
+(宣告式欄位),本節檢查「元件本身的 socket 形狀」(introspection)——
+custom 元件無宣告可查,建構期直接檢視
+`__haystack_input__` / `__haystack_output__`。
+
+支援的槽位與契約(`SLOT_CONTRACTS`):
+
+| 槽位 | 必要輸入 sockets | 必要輸出 sockets |
+|---|---|---|
+| query_transformation | `queries: list[str]` | `queries: list[str]` |
+| retrieval | `query: str` | `documents: list[Document]` |
+| reranking | `query: str`、`documents: list[Document]` | `documents: list[Document]` |
+| routing | `query: str` | `route: dict[str, Any]` |
+
+驗證規則(不符 → `ConfigError`,訊息指明缺什麼、實際有什麼、怎麼改):
+
+- 契約 sockets 必須存在,型別採**寬鬆相容**(與 `Pipeline.connect`
+  同判準,私有 API 失效時退回型別名稱比對)。
+- **額外輸出 sockets 允許**(`query()` 以 `include_outputs_from` 收集
+  全節點輸出,額外輸出自動進 trace)。
+- **契約外的必填輸入不允許**(圖上沒有上游會餵它,執行期必缺輸入);
+  有預設值的額外輸入允許。
+- **邊界映射責任**:外部系統的欄位在 custom 元件**內部**轉成 canonical
+  型別(內文 → `Document.content`、分數 → `score`、其餘無損進 `meta`),
+  並建議補 §1 的 `doc_id` / `chunk_id` 契約鍵。槽位之間永遠只流
+  canonical 型別 —— 讓公司格式流出邊界,就是模組間的兩兩耦合。
+- 其他槽位(generation / embedding / indexing …)的 factory 回傳形狀
+  不是單一元件,暫不支援 custom;需求出現時再為其設計契約。
+
+範例骨架:`examples/custom_modules/` + `configs/custom_demo.yaml`
+(有整合測試 `tests/test_custom_demo.py` 保證永遠可跑)。
+
 ## 5. 服務模式不變量(`rag/service.py` + `rag/kb_meta.py`)
 
 - **索引內容必須與 ingestion 設定一致**。強制機制:ingestion 指紋 =
@@ -104,7 +144,9 @@ Evaluation: JSONL 測試集 → 逐題 RagPipelines.query() → hit_rate / MRR
   區塊,`json.dumps(sort_keys=True)` 後 sha256。展開前計算 →
   `${ENV_VAR}` 機密不進雜湊;解析後的 dict → 註解 / 排版 / anchor
   重構不影響。已知盲區:env var **值**的輪替、escape-hatch pipeline
-  檔的內容變更。
+  檔的內容變更、custom module **.py 檔內容**的變更(config 中的
+  file / class_path 路徑有進指紋,檔案內容沒有;inference 端的 custom
+  以 `/reload` 重載即可生效 —— 每次建構都重新 exec 檔案)。
 - 指紋**排除操作性欄位**:`indexing` 的 `incremental` 與連線憑證 / TLS
   (`api_key` / `username` / `password` / `ca_certs` / `verify_certs`)——
   它們決定「怎麼跑」與「連不連得上」,不決定索引裡有什麼;索引位置仍由
@@ -119,8 +161,9 @@ Evaluation: JSONL 測試集 → 逐題 RagPipelines.query() → hit_rate / MRR
 ## 6. 新需求進來時怎麼判斷
 
 1. **是「同一槽位的另一種做法」嗎?**(換 LLM、新切法、新指標)
-   → 新增方法:寫元件(或直接用 Haystack 現成元件)+ factory +
-   對映表加一行。九成需求在這裡,見 README「新增自訂方法」。
+   → 通用的做法:寫元件 + factory + 對映表加一行(進框架型錄);
+   專案 / 公司特定的邏輯:寫成 custom module(`method: custom`,
+   零框架改動,見 §4b)。九成需求在這裡,見 README「新增自訂方法」。
 2. **是「資料要多帶一點資訊」嗎?**(新的追溯欄位)
    → 加 meta 鍵:只加不改,舊元件不讀新鍵也不會壞。
 3. **是「新的檔案型別」嗎?**(docx、html…)

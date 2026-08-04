@@ -200,6 +200,11 @@ class InferenceConfig(BaseModel):
         default=None,
         description="融合 / 聚合步驟(選填;多子查詢或 doc/page 聚合時使用)",
     )
+    routing: MethodConfig | None = Field(
+        default=None,
+        description="槽位:Question Routing(選填;判斷查詢類別,結果附加於"
+        "輸出的 routing key,不影響檢索行為)",
+    )
 
     @model_validator(mode="after")
     def _generation_required_unless_skipped(self) -> "InferenceConfig":

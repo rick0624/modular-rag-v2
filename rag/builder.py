@@ -69,7 +69,9 @@ from rag.components.query_transforms import (
     LLMQueryRewriter,
     QueryNormalizer,
 )
+from rag.components.routing import KeywordRouteClassifier
 from rag.config import FusionConfig, MethodConfig, RAGConfig
+from rag.custom import CustomModuleParams, instantiate_custom
 from rag.errors import (
     ConfigError,
     IncompatiblePipelineError,
@@ -921,6 +923,34 @@ GENERATION_FACTORIES: dict[str, SlotFactory] = {
 }
 
 
+class _KeywordMatchParams(BaseParams):
+    routes: dict[str, list[str]] = Field(
+        description="類別 → 關鍵字清單(查詢包含關鍵字即命中)"
+    )
+    default_category: str = Field(
+        default="general", description="沒有任何關鍵字命中時回傳的類別"
+    )
+
+
+def _build_keyword_match(raw: dict[str, Any], ctx: BuildContext) -> Any:
+    p = _validate_params("routing", "keyword_match", _KeywordMatchParams, raw)
+    return KeywordRouteClassifier(
+        routes=p.routes, default_category=p.default_category
+    )
+
+
+def _build_custom_routing(raw: dict[str, Any], ctx: BuildContext) -> Any:
+    p = _validate_params("routing", "custom", CustomModuleParams, raw)
+    return instantiate_custom("routing", p)
+
+
+# routing 槽位本身是選填(config 省略 = 不做),因此不提供 "none" 方法。
+ROUTING_FACTORIES: dict[str, SlotFactory] = {
+    "keyword_match": SlotFactory(build=_build_keyword_match),
+    "custom": SlotFactory(build=_build_custom_routing),
+}
+
+
 def _chat_generator_from_block(
     where: str, block: dict[str, Any] | None, ctx: BuildContext
 ) -> Any:
@@ -1045,6 +1075,11 @@ def _build_passthrough(raw: dict[str, Any], ctx: BuildContext) -> None:
     return None
 
 
+def _build_custom_transform(raw: dict[str, Any], ctx: BuildContext) -> Any:
+    p = _validate_params("query_transformation", "custom", CustomModuleParams, raw)
+    return instantiate_custom("query_transformation", p)
+
+
 TRANSFORM_FACTORIES: dict[str, SlotFactory] = {
     "passthrough": SlotFactory(build=_build_passthrough),
     "normalize": SlotFactory(build=_build_normalize),
@@ -1052,6 +1087,7 @@ TRANSFORM_FACTORIES: dict[str, SlotFactory] = {
     "jargon_mapping": SlotFactory(build=_build_jargon_mapping),
     "llm_rewrite": SlotFactory(build=_build_llm_rewrite),
     "llm_decompose": SlotFactory(build=_build_llm_decompose),
+    "custom": SlotFactory(build=_build_custom_transform),
 }
 
 
@@ -1169,12 +1205,18 @@ def _build_no_rerank(raw: dict[str, Any], ctx: BuildContext) -> None:
     return None
 
 
+def _build_custom_reranker(raw: dict[str, Any], ctx: BuildContext) -> Any:
+    p = _validate_params("reranking", "custom", CustomModuleParams, raw)
+    return instantiate_custom("reranking", p)
+
+
 RERANKING_FACTORIES: dict[str, SlotFactory] = {
     "none": SlotFactory(build=_build_no_rerank),
     "similarity": SlotFactory(build=_build_similarity_ranker),
     "api_rerank": SlotFactory(build=_build_api_ranker),
     "llm": SlotFactory(build=_build_llm_ranker),
     "llm_fact_check": SlotFactory(build=_build_llm_fact_check),
+    "custom": SlotFactory(build=_build_custom_reranker),
 }
 
 
@@ -1289,6 +1331,17 @@ def _build_hybrid_retrieval(raw: dict[str, Any], ctx: BuildContext) -> _Retrieva
     )
 
 
+def _build_custom_retrieval(raw: dict[str, Any], ctx: BuildContext) -> _RetrievalGraph:
+    p = _validate_params("retrieval", "custom", CustomModuleParams, raw)
+    comp = instantiate_custom("retrieval", p)
+    return _RetrievalGraph(
+        components={"retriever": comp},
+        connections=[],
+        query_targets=[("retriever", "query")],
+        output="retriever",
+    )
+
+
 RETRIEVAL_FACTORIES: dict[str, SlotFactory] = {
     "bm25": SlotFactory(
         build=_build_bm25_retrieval,
@@ -1302,6 +1355,9 @@ RETRIEVAL_FACTORIES: dict[str, SlotFactory] = {
         build=_build_hybrid_retrieval,
         required_capabilities=frozenset({"vector_search", "text_search"}),
     ),
+    # custom 不宣告 required_capabilities:自訂 retriever 通常自帶檢索
+    # 後端(如公司 ES 的 HTTP API),不依賴 ctx.store 的能力。
+    "custom": SlotFactory(build=_build_custom_retrieval),
 }
 
 
@@ -1434,6 +1490,18 @@ def build_inference_pipeline(
     )
     outer.connect("multi_query.results", "fusion.results")
 
+    # routing:獨立支線 —— 吃原始查詢(query() 直接餵,如同 prompt_builder
+    # 的 query),圖上沒有下游;判斷結果由 query() 收進回傳值與 trace。
+    routing_enabled = False
+    if inf.routing is not None:
+        routing_method = _require_single("routing", inf.routing)
+        routing_factory = _resolve("routing", ROUTING_FACTORIES, routing_method)
+        outer.add_component(
+            "routing",
+            routing_factory.build(inf.routing.params_for(routing_method), ctx),
+        )
+        routing_enabled = True
+
     if inf.generate_answer:
         generation_method = _require_single("generation", inf.generation)
         generation_factory = _resolve(
@@ -1463,6 +1531,7 @@ def build_inference_pipeline(
         "query_entry": query_entry,
         "generate_answer": inf.generate_answer,
         "transform_names": transform_names,
+        "routing_enabled": routing_enabled,
     }
 
 
@@ -1490,6 +1559,7 @@ class RagPipelines:
     query_entry: tuple[str, str] | None = None
     generate_answer: bool = True
     transform_names: list[str] = dc_field(default_factory=list)
+    routing_enabled: bool = False
 
     def run_ingestion(self) -> dict[str, Any]:
         """執行 ingestion(來源資訊已在 config 中)。
@@ -1568,7 +1638,8 @@ class RagPipelines:
             dict:``answer``(回答文字)、``documents``(融合後切片)、
             ``subquery_results``(各子查詢重排後結果)、``prompt``
             (實際送出的 prompt,可稽核)、``reply_meta``(模型 /
-            finish_reason / usage 等)、``trace``(逐步紀錄,見下)。
+            finish_reason / usage 等)、``routing``(查詢分類結果;
+            未設定 routing 槽位時為 ``None``)、``trace``(逐步紀錄,見下)。
             檢索-only 模式(``generate_answer: false``)key 不變,
             但 ``answer`` / ``prompt`` / ``reply_meta`` 為 ``None``。
 
@@ -1577,6 +1648,7 @@ class RagPipelines:
                 {
                   "query": 原始查詢,
                   "transforms": [{component, type, queries}],   # 每段改寫後的查詢
+                  "routing": {category, ...} | None,            # 查詢分類(獨立支線)
                   "subqueries": [{query, steps: [{component, type, documents}]}],
                   "fusion": {documents},                        # 融合 / 去重後
                   "generation": {prompt, answer, meta} | None,
@@ -1599,7 +1671,15 @@ class RagPipelines:
         include = set(self.inference.graph.nodes)
         if self.generate_answer:
             data["prompt_builder"] = {"query": text}
+        if self.routing_enabled:
+            # routing 吃原始查詢(不經 transform 鏈),與 prompt_builder 同機制
+            data["routing"] = {"query": text}
         result = self.inference.run(data, include_outputs_from=include)
+        route = (
+            (result.get("routing") or {}).get("route")
+            if self.routing_enabled
+            else None
+        )
         answer = prompt_text = reply_meta = None
         if self.generate_answer:
             reply = result["generator"]["replies"][0]
@@ -1623,9 +1703,11 @@ class RagPipelines:
             "subquery_results": result["multi_query"]["results"],
             "prompt": prompt_text,
             "reply_meta": reply_meta,
+            "routing": route,
             "trace": {
                 "query": text,
                 "transforms": transforms,
+                "routing": route,
                 "subqueries": result["multi_query"].get("traces", []),
                 "fusion": {
                     "documents": result["fusion"]["documents"],
@@ -1660,6 +1742,7 @@ def build_pipelines(config: RAGConfig, *, store: Any = None) -> RagPipelines:
     query_entry: tuple[str, str] | None = None
     generate_answer = True
     transform_names: list[str] = []
+    routing_enabled = False
     if native is not None and native.inference is not None:
         inference_pipeline = _load_native_pipeline(native.inference)
     else:
@@ -1667,6 +1750,7 @@ def build_pipelines(config: RAGConfig, *, store: Any = None) -> RagPipelines:
         query_entry = meta["query_entry"]
         generate_answer = meta["generate_answer"]
         transform_names = meta["transform_names"]
+        routing_enabled = meta["routing_enabled"]
     return RagPipelines(
         config=config,
         ingestion=ingestion_pipeline,
@@ -1675,4 +1759,5 @@ def build_pipelines(config: RAGConfig, *, store: Any = None) -> RagPipelines:
         query_entry=query_entry,
         generate_answer=generate_answer,
         transform_names=transform_names,
+        routing_enabled=routing_enabled,
     )
