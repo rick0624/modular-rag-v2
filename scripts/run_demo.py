@@ -7,6 +7,15 @@
     python scripts/run_demo.py --config configs/condense.yaml --trace
         # 終端機逐步印出每個元件做了什麼(改寫、各路檢索、每段重排、融合)
 
+只測 inference(不重跑 ingestion)加 ``--skip-ingest``:
+
+    python scripts/run_demo.py --config configs/custom_demo.yaml --skip-ingest
+
+適用於索引已建好(elasticsearch,會比對 ingestion 指紋)、或 retrieval
+走 custom 外部檢索不吃本地索引時 —— 改 prompt / 改寫 / 重排的迭代不必
+每次重新切塊與 embedding。in_memory 索引是空的,單獨用會查不到東西
+(會出聲提醒)。
+
 每次執行都會另外寫一份完整紀錄到 ``logs/run-<時間戳>.log``
 (含 LLM 實際 prompt 與回覆、每步全部切片,不截斷);
 ``--log-file`` 可指定路徑,``--no-log-file`` 可關閉。
@@ -25,7 +34,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from rag import build_pipelines, load_config  # noqa: E402
+from rag.config import RAGConfig, load_raw_config  # noqa: E402
 from rag.evaluation import run_evaluation  # noqa: E402
+from rag.kb_meta import (  # noqa: E402
+    indexing_info,
+    ingestion_fingerprint,
+    read_fingerprint,
+)
 from rag.logging_config import (  # noqa: E402
     default_log_path,
     quiet_dependency_handlers,
@@ -50,12 +65,75 @@ def _emit(lines: list[str], to_console: bool) -> None:
         logger.info(line)
 
 
+def _warn(message: str) -> None:
+    """終端機與 log 檔同時出聲(安靜地查一個空索引是最難查的問題)。
+
+    與 :func:`_emit` 同機制:print 負責終端機(不受 ``--log-level``
+    影響,一定看得到),log 走 INFO —— 用 warning 會被終端機 handler
+    再印一次,同一句話出現兩行。
+    """
+    print(f"⚠ {message}")
+    logger.info(message)
+
+
+def _report_skipped_ingestion(
+    config_path: str, config: RAGConfig, store: object
+) -> None:
+    """``--skip-ingest``:確認索引狀態,不一致就出聲(不中止)。
+
+    比照服務模式的 ``--skip-ingest``:elasticsearch 比對 ingestion 指紋
+    (設定變了但索引沒重建 → 查詢結果會無聲劣化);in_memory 索引本來
+    就是空的,除非 retrieval 走 custom(自帶外部檢索後端,不吃本地索引)。
+    """
+    method, index_name = indexing_info(config)
+    retrieval_method = (
+        config.inference.retrieval.methods()[0]
+        if config.inference is not None
+        else ""
+    )
+    if method != "elasticsearch":
+        if retrieval_method == "custom":
+            print(f"跳過 ingestion(retrieval 走 custom,不吃本地 {method} 索引)")
+        else:
+            _warn(
+                f"--skip-ingest 搭配 {method or 'in_memory'} 索引:索引是空的,"
+                "查詢不會有結果。持久化索引請改用 elasticsearch,"
+                "或移除 --skip-ingest 重跑 ingestion"
+            )
+        return
+
+    try:
+        stored = read_fingerprint(method, store, index_name)
+    except Exception as exc:  # 連線失敗 / 索引不存在以外的錯誤
+        _warn(
+            f"--skip-ingest 但讀不到索引 '{index_name}' 上的 ingestion 指紋"
+            f"({type(exc).__name__}: {exc});無法確認索引與設定是否一致"
+        )
+        return
+    current = ingestion_fingerprint(load_raw_config(config_path))
+    if stored != current:
+        _warn(
+            f"--skip-ingest 但索引 '{index_name}' 上的 ingestion 指紋"
+            f"({(stored or '不存在')[:12]}…)與目前設定({current[:12]}…)不符;"
+            "索引內容可能與設定不一致(embedding 模型 / 切塊參數變了?)。"
+            "要以目前設定重建請移除 --skip-ingest"
+        )
+        return
+    print(f"跳過 ingestion(索引 '{index_name}' 的 ingestion 指紋相符)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="modular-rag-v2 端到端 demo")
     parser.add_argument(
         "--config", default="configs/default.yaml", help="YAML 設定檔路徑"
     )
     parser.add_argument("--query", default="FAISS 支援哪些索引結構?", help="查詢文字")
+    parser.add_argument(
+        "--skip-ingest",
+        action="store_true",
+        help="只跑 inference:不執行 ingestion(索引須已建好,或 retrieval "
+        "走 custom 外部檢索);elasticsearch 會比對 ingestion 指紋",
+    )
     parser.add_argument(
         "--trace",
         action="store_true",
@@ -93,30 +171,36 @@ def main() -> None:
     ensure_sample_data()  # 範例語料與評估集(已存在的檔案不覆寫)
     config = load_config(args.config)
     logger.info("=" * 70)
-    logger.info("config=%s  query=%r", args.config, args.query)
+    logger.info(
+        "config=%s  query=%r  skip_ingest=%s", args.config, args.query, args.skip_ingest
+    )
     logger.info("=" * 70)
-    pipelines = build_pipelines(config)
+    pipelines = build_pipelines(config, skip_ingestion=args.skip_ingest)
     quiet_dependency_handlers()  # 建 pipeline 時才載入的套件(HF…)補一次
 
-    logger.info("=== Ingestion(%s)===", args.config)
-    ingestion_result = pipelines.run_ingestion()
-    _emit(format_ingestion_trace(ingestion_result["trace"]), args.trace)
-    written = ingestion_result.get("writer", {}).get("documents_written") or 0
-    notes = []
-    skipped_chunks = ingestion_result.get("change_filter", {}).get("skipped")
-    if skipped_chunks:
-        notes.append(f"增量:{skipped_chunks} 筆切片未變更")
-    skipped_files = ingestion_result.get("source_filter", {}).get("skipped_files")
-    if skipped_files:
-        notes.append(f"{len(skipped_files)} 個檔案未變更未重新解析")
-    extra = f"({'; '.join(notes)})" if notes else ""
-    print(f"已索引 {written} 個切片{extra}({args.config})")
-    empty_sources = ingestion_result.get("empty_sources")
-    if empty_sources:
-        print(
-            f"⚠ 以下檔案沒有產出任何切片(掃描檔需要 OCR?詳見 log):"
-            f"{'、'.join(empty_sources)}"
-        )
+    if args.skip_ingest:
+        logger.info("=== 跳過 Ingestion(--skip-ingest)===")
+        _report_skipped_ingestion(args.config, config, pipelines.store)
+    else:
+        logger.info("=== Ingestion(%s)===", args.config)
+        ingestion_result = pipelines.run_ingestion()
+        _emit(format_ingestion_trace(ingestion_result["trace"]), args.trace)
+        written = ingestion_result.get("writer", {}).get("documents_written") or 0
+        notes = []
+        skipped_chunks = ingestion_result.get("change_filter", {}).get("skipped")
+        if skipped_chunks:
+            notes.append(f"增量:{skipped_chunks} 筆切片未變更")
+        skipped_files = ingestion_result.get("source_filter", {}).get("skipped_files")
+        if skipped_files:
+            notes.append(f"{len(skipped_files)} 個檔案未變更未重新解析")
+        extra = f"({'; '.join(notes)})" if notes else ""
+        print(f"已索引 {written} 個切片{extra}({args.config})")
+        empty_sources = ingestion_result.get("empty_sources")
+        if empty_sources:
+            print(
+                f"⚠ 以下檔案沒有產出任何切片(掃描檔需要 OCR?詳見 log):"
+                f"{'、'.join(empty_sources)}"
+            )
 
     logger.info("=== 查詢 === %s", args.query)
     result = pipelines.query(args.query)

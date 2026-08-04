@@ -343,6 +343,73 @@ class TestSkipGeneration:
         assert "ranker" in inner.to_dict()["components"]
 
 
+class TestSkipIngestion:
+    """``skip_ingestion=True``:只組 inference(run_demo.py --skip-ingest)。"""
+
+    def test_only_inference_is_built(self, corpus_dir):
+        config = parse_config(
+            make_config(
+                ingestion={
+                    "import": {
+                        "method": "local_file",
+                        "params": {
+                            "input_dir": str(corpus_dir),
+                            "extensions": [".txt"],
+                        },
+                    }
+                }
+            )
+        )
+        pipelines = build_pipelines(config, skip_ingestion=True)
+        assert pipelines.ingestion is None
+        assert pipelines.store is not None  # inference 端自行依 indexing 建
+        assert pipelines.query_entry is not None
+        # 查詢仍可執行(索引是空的,結果就是空的 —— 不是錯誤)
+        assert pipelines.query("向量檢索")["documents"] == []
+
+    def test_run_ingestion_refuses_and_points_at_fix(self, corpus_dir):
+        config = parse_config(make_config())
+        pipelines = build_pipelines(config, skip_ingestion=True)
+        with pytest.raises(ConfigError, match="skip_ingestion=True"):
+            pipelines.run_ingestion()
+
+    def test_missing_source_dir_is_not_touched(self, tmp_path):
+        """來源資料夾不必存在:ingestion 側元件根本沒建。"""
+        config = parse_config(
+            make_config(
+                ingestion={
+                    "import": {
+                        "method": "local_file",
+                        "params": {
+                            "input_dir": str(tmp_path / "no_such_dir"),
+                            "extensions": [".txt"],
+                        },
+                    }
+                }
+            )
+        )
+        pipelines = build_pipelines(config, skip_ingestion=True)
+        assert pipelines.ingestion is None
+
+    def test_default_still_builds_ingestion(self, corpus_dir):
+        config = parse_config(
+            make_config(
+                ingestion={
+                    "import": {
+                        "method": "local_file",
+                        "params": {
+                            "input_dir": str(corpus_dir),
+                            "extensions": [".txt"],
+                        },
+                    }
+                }
+            )
+        )
+        pipelines = build_pipelines(config)
+        assert pipelines.ingestion is not None
+        assert pipelines.run_ingestion()["writer"]["documents_written"] > 0
+
+
 def test_native_pipeline_stage_requires_build_pipelines():
     data = make_config()
     del data["ingestion"]

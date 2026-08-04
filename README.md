@@ -30,7 +30,7 @@ Evaluation: JSONL 測試集 → 逐題查詢 → hit rate / MRR
 | query_transformation | **normalize** / passthrough / glossary / jargon_mapping / llm_rewrite / llm_decompose / custom | 自訂元件(`list[str] → list[str]`) |
 | retrieval | **bm25** / embedding / hybrid(皆支援 `boost_k_factor` 候選放大) / custom | 依 indexing 選 retriever;hybrid 走 RRF |
 | reranking | **none** / similarity / api_rerank / llm / llm_fact_check / custom | ST cross-encoder / 自訂 Flexible API ranker / core LLMRanker / 自訂 LLMFactChecker |
-| generation | **mock** / openai / gateway_openai_compatible(`generate_answer: false` 可跳過) | OpenAIChatGenerator / 自訂閘道 generator |
+| generation | **mock** / openai / gateway_openai_compatible / custom(`generate_answer: false` 可跳過) | OpenAIChatGenerator / 自訂閘道 generator / 自訂元件(`messages → replies`) |
 | routing(選填槽位,省略=不做) | keyword_match / custom | 自訂 KeywordRouteClassifier;結果進 `query()` 的 `routing` key,不影響檢索 |
 | fusion(內建步驟) | rrf / concat_dedup / max_score × group_by none/doc/page | 自訂 SubqueryFusion(v1 演算法) |
 | evaluation | basic_retrieval_metrics | hit rate / MRR(doc_id 依名次去重) |
@@ -66,6 +66,28 @@ python scripts/run_demo.py --config configs/company.yaml    # 公司環境(見�
 demo 會自動建立範例語料(`./data/raw`)與評估集(`./data/eval/qa.jsonl`),
 依序執行 ingestion → 查詢 → 評估,印出融合後檢索結果、實際送出的
 prompt(可稽核)、回答與 hit rate / MRR。
+
+### 只測 inference(`--skip-ingest`)
+
+改 prompt、改寫、重排的迭代不需要每次重切塊 + 重算 embedding。加
+`--skip-ingest` 就只跑 inference(查詢 → 評估),ingestion pipeline
+連建都不建:
+
+```bash
+python scripts/run_demo.py --config configs/docs.yaml --skip-ingest --query "你的問題"
+python scripts/run_demo.py --config configs/custom_demo.yaml --skip-ingest
+```
+
+前提是**索引裡已經有內容**,兩種情形成立:
+
+| 情形 | 行為 |
+|---|---|
+| `indexing: elasticsearch`(索引先前建好) | 比對 ingestion 指紋,不符會出聲(設定變了但索引沒重建 → 結果會無聲劣化) |
+| `retrieval: custom`(外部檢索,不吃本地索引) | 直接跑 |
+| `indexing: in_memory` 且 retrieval 走本地索引 | 索引是空的 → 印警告,查詢不會有結果 |
+
+程式接入時對應 `build_pipelines(config, skip_ingestion=True)`,此時
+`RagPipelines.ingestion` 是 `None`,呼叫 `run_ingestion()` 會直接報錯。
 
 ### 逐步紀錄(trace)
 
@@ -238,7 +260,8 @@ result["routing"]     # 查詢分類結果(未設 routing 槽位時為 None)
 
 ## 服務模式(HTTP API)
 
-`run_demo.py` 是批次模式:每次執行都重跑 ingestion。長駐服務改用
+`run_demo.py` 是批次模式:每次執行都重跑 ingestion(`--skip-ingest`
+可只跑 inference,但仍是跑完一題就結束)。長駐服務改用
 `serve.py` —— **一份 config 啟動一個 KB 服務**,ingestion 與 inference
 同駐一個 process(共用 store,embedding 等跨階段設定結構上保證一致),
 啟動時 ingest 一次,之後查詢不再重建索引:
@@ -394,6 +417,7 @@ class BySentenceSplitter:
 | retrieval | `query: str` | `documents: list[Document]` |
 | reranking | `query: str` + `documents: list[Document]` | `documents: list[Document]` |
 | routing | `query: str` | `route: dict[str, Any]` |
+| generation | `messages: list[ChatMessage]` | `replies: list[ChatMessage]` |
 
 規則與慣例:
 
@@ -407,12 +431,22 @@ class BySentenceSplitter:
   才能直接運作。
 - custom 可出現在方法鏈中(`method: [normalize, custom]`),但同一條鏈
   只能有一個 `custom`(需要兩個時把邏輯合併成一個元件,或走路 B)。
-- generation / embedding / indexing 等其他槽位暫不支援 custom(factory
-  回傳形狀不是單一元件);有需求時走路 B。
+- **generation 的 custom 是「換掉 LLM 客戶端」,不是換掉 prompt 組裝**:
+  契約就是 Haystack 的 ChatGenerator 形狀,`prompt_template` /
+  `system_prompt` 照常寫在 YAML,元件收到的是框架組好的 messages。
+  同一支元件也能掛在 `llm_rewrite` / `llm_decompose` / `llm` /
+  `llm_fact_check` 的 `params.generator`,整條 pipeline 只走公司的推論
+  服務。OpenAI 相容的閘道**不需要**寫 custom,用
+  `gateway_openai_compatible` 即可。
+- embedding / indexing 槽位暫不支援 custom(factory 回傳形狀不是單一
+  元件:embedding 是 document / text 一對,indexing 是 document store);
+  有需求時走路 B。
 - 完整可跑的骨架見 [examples/custom_modules/](examples/custom_modules/)
-  (公司檢索 / 重排 / 分類三支,`TODO(替換點)` 標明換入真實邏輯的位置)
-  與 [configs/custom_demo.yaml](configs/custom_demo.yaml):
+  (公司改寫 / 檢索 / 重排 / 分類 / 生成五支,`TODO(替換點)` 標明換入
+  真實邏輯的位置)與 [configs/custom_demo.yaml](configs/custom_demo.yaml):
   `python scripts/run_demo.py --config configs/custom_demo.yaml --trace`
+  (custom retrieval 不吃本地索引,所以這份 config 也能加 `--skip-ingest`
+  只跑 inference)
 - 注意:custom module 就是執行任意 Python 程式碼,與 config 檔同一
   信任層級,只載入你信任的來源。
 
