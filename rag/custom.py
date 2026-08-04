@@ -29,6 +29,11 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from rag.contracts import validate_component_contract
 from rag.errors import ConfigError
 
+# ``file:`` 載入的模組掛在這個虛擬套件底下(模組名 = 前綴 + 檔名 + 路徑雜湊)。
+# :mod:`rag.logging_config` 會把這棵樹設成 DEBUG,使用者在 custom module 裡寫
+# ``logging.getLogger(__name__)`` 才記得進 log 檔(見該模組的 setup_logging)。
+CUSTOM_MODULE_PACKAGE = "_rag_custom"
+
 
 class CustomModuleParams(BaseModel):
     """``method: custom`` 的參數 schema(所有支援 custom 的槽位共用)。
@@ -134,7 +139,7 @@ def _load_from_file(where: str, file: str, cls_name: str) -> type:
     # 模組名帶路徑雜湊:不同路徑的同名檔不互撞;每次建構重新 exec,
     # /reload 換了檔案內容即生效。
     digest = hashlib.sha1(resolved.encode("utf-8")).hexdigest()[:8]
-    module_name = f"_rag_custom.{path.stem}_{digest}"
+    module_name = f"{CUSTOM_MODULE_PACKAGE}.{path.stem}_{digest}"
     spec = importlib.util.spec_from_file_location(module_name, resolved)
     if spec is None or spec.loader is None:
         raise ConfigError(f"{where}:無法從 '{resolved}' 建立模組載入器")

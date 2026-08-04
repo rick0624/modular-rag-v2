@@ -139,6 +139,11 @@ custom 元件無宣告可查,建構期直接檢視
   的 `params.generator` 底下 —— 那些方法本來就吃「generation 槽位的任一
   方法」。回傳的 `replies` 至少要有一則(框架取 `replies[0]`),
   `meta` 原樣進 `query()` 的 `reply_meta`。
+- **log 的歸屬**:`file:` 載入的模組名是 `_rag_custom.<檔名>_<路徑雜湊>`
+  (`rag.custom.CUSTOM_MODULE_PACKAGE`),`setup_logging` 把這棵樹與 `rag`
+  同等設成 DEBUG,所以 `getLogger(__name__)` 的紀錄進得了 log 檔;
+  `class_path:` 載入的模組名不在框架掌握範圍,慣例是自己命名在
+  `rag.custom.*` 底下(見 README「自訂方法」)。
 - 其他槽位(embedding / indexing …)的 factory 回傳形狀不是單一元件
   (embedding 是 document / text 一對,indexing 是 document store),
   暫不支援 custom;需求出現時再為其設計契約。

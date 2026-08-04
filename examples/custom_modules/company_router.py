@@ -23,7 +23,9 @@ from typing import Any
 
 from haystack import component
 
-logger = logging.getLogger(__name__)
+# logger 命名在 "rag.*" 底下:file: 與 class_path: 兩種載入方式都吃得到
+# 框架的 log 檔設定(見 README「自訂方法」的「log 要看得到」)。
+logger = logging.getLogger("rag.custom.company_router")
 
 # 示範規則(TODO(替換點):接上真正的分類邏輯後刪除)。
 _DEFAULT_RULES: dict[str, list[str]] = {
