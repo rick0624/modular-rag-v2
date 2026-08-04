@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 from typing import Any
 
 FINGERPRINT_KEY = "modular_rag_ingestion_fingerprint"
@@ -74,14 +75,63 @@ def _strip_operational_keys(ingestion: Any) -> Any:
     return result
 
 
+# ingestion 端支援 custom module 的槽位:這些槽位的 ``file:`` **檔案內容**
+# 要進指紋 —— 改了解析 / 切塊邏輯沒重建索引,索引內容就與設定不一致,
+# 與改 chunking 參數同罪。inference 端的 custom 刻意不雜湊(改了走 /reload
+# 即生效,不影響索引內容);class_path 指向已安裝套件,無單一檔案可雜湊,
+# 只有路徑字串進指紋(文件註明此限制)。
+_CUSTOM_FILE_SLOTS = ("import", "parsing", "chunking")
+
+
+def custom_file_hashes(ingestion: Any) -> dict[str, str]:
+    """收集 ingestion 端 custom module 的 ``file:`` 內容雜湊。
+
+    輸入為原始(或解析後)的 ingestion dict;對 :data:`_CUSTOM_FILE_SLOTS`
+    中 method 含 "custom" 的槽位,依 ``params_for`` 的優先序
+    (``method_params.custom`` 蓋過 ``params``)取 ``file`` 並雜湊其內容。
+    檔案讀不到(路徑含未展開的 ``${ENV_VAR}``、或建索引的主機上沒這個檔)
+    時該槽位靜默退回 path-only —— 指紋仍含路徑字串,只是看不見內容變更。
+    """
+    hashes: dict[str, str] = {}
+    if not isinstance(ingestion, dict):
+        return hashes
+    for slot in _CUSTOM_FILE_SLOTS:
+        block = ingestion.get(slot)
+        if not isinstance(block, dict):
+            continue
+        method = block.get("method")
+        methods = method if isinstance(method, list) else [method]
+        if "custom" not in methods:
+            continue
+        method_params = block.get("method_params")
+        custom_block = (
+            method_params.get("custom") if isinstance(method_params, dict) else None
+        )
+        params = custom_block if isinstance(custom_block, dict) else block.get("params")
+        file = params.get("file") if isinstance(params, dict) else None
+        if not isinstance(file, str):
+            continue
+        try:
+            digest = hashlib.sha256(Path(file).read_bytes()).hexdigest()
+        except (OSError, ValueError):
+            continue  # path-only 退路:路徑字串本來就在指紋裡
+        hashes[slot] = digest
+    return hashes
+
+
 def ingestion_fingerprint(raw_config: dict[str, Any]) -> str:
     """計算 ingestion 相關區塊的 sha256 指紋(輸入為展開前的原始 dict)。"""
+    ingestion = raw_config.get("ingestion")
     payload = {
-        "ingestion": _strip_operational_keys(raw_config.get("ingestion")),
+        "ingestion": _strip_operational_keys(ingestion),
         "haystack_pipelines.ingestion": (
             (raw_config.get("haystack_pipelines") or {}).get("ingestion")
         ),
     }
+    # 非空才併入:沒用 ingestion custom 的 config 指紋逐位元不變(相容)。
+    file_hashes = custom_file_hashes(ingestion)
+    if file_hashes:
+        payload["custom_module_files"] = file_hashes
     canonical = json.dumps(
         payload,
         sort_keys=True,
@@ -137,9 +187,18 @@ def write_fingerprint(
 
 
 def parse_config_key(ingestion_dump: dict[str, Any]) -> str:
-    """由解析後的 ingestion 設定計算 manifest 的作廢鍵。"""
+    """由解析後的 ingestion 設定計算 manifest 的作廢鍵。
+
+    custom module 的 ``file:`` 內容一併納入:custom parsing / chunking 的
+    .py 改了,同一份檔案會產出不同切片 —— 只看 config 的話檔案層增量會
+    誤判「沒變就跳過 parse」,索引停留在舊解析邏輯。
+    """
+    payload: dict[str, Any] = dict(ingestion_dump)
+    file_hashes = custom_file_hashes(ingestion_dump)
+    if file_hashes:  # 非空才併入:既有 manifest 的 key 不變
+        payload["__custom_module_files__"] = file_hashes
     canonical = json.dumps(
-        ingestion_dump, sort_keys=True, ensure_ascii=False,
+        payload, sort_keys=True, ensure_ascii=False,
         separators=(",", ":"), default=str,
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

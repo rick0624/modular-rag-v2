@@ -162,21 +162,60 @@ class IngestionConfig(BaseModel):
 
 
 class FusionConfig(BaseModel):
-    """融合 / 聚合步驟的設定(pipeline 內建步驟,非槽位)。
+    """融合 / 聚合步驟的設定。
 
-    query transformation 拆出多個子查詢、或設定了 ``group_by`` 聚合時生效;
-    都沒有時此步驟等於不存在。
+    兩種寫法,擇一:
+
+    - **內建**(原有扁平寫法):``group_by`` / ``strategy`` / ``top_k``。
+      query transformation 拆出多個子查詢、或有此區塊時生效;
+      都沒有時此步驟等於不存在(單一查詢原樣通過)。
+    - **custom module**:``method: custom`` + ``params``(file/class 或
+      class_path,init_params 透傳)。掛上即**一律執行**(單一查詢也進
+      元件,原樣通過與否由元件自己決定),因此不可與內建參數混用。
     """
 
     model_config = ConfigDict(extra="forbid")
 
+    method: str | None = Field(
+        default=None,
+        description="'custom' 掛自訂融合元件;省略(None)= 內建融合",
+    )
+    params: dict[str, Any] = Field(
+        default_factory=dict,
+        description="method: custom 的參數(file/class 或 class_path、init_params)",
+    )
     group_by: Literal["none", "doc", "page"] = Field(
-        default="none", description="聚合粒度:切片 / 文件 / 頁"
+        default="none", description="聚合粒度:切片 / 文件 / 頁(僅內建)"
     )
     strategy: Literal["rrf", "concat_dedup", "max_score"] = Field(
-        default="rrf", description="排序策略(rrf 為名次法,跨子查詢最安全)"
+        default="rrf", description="排序策略(rrf 為名次法,跨子查詢最安全;僅內建)"
     )
-    top_k: int = Field(default=5, gt=0, description="融合後保留的筆數上限")
+    top_k: int = Field(default=5, gt=0, description="融合後保留的筆數上限(僅內建)")
+
+    @model_validator(mode="after")
+    def _builtin_xor_custom(self) -> "FusionConfig":
+        # model_fields_set 只含 YAML 顯式寫出的欄位:顯式寫預設值也算混用
+        # (使用者以為參數會生效,實際被 custom 元件忽略 —— 必須擋)。
+        flat_given = {"group_by", "strategy", "top_k"} & self.model_fields_set
+        if self.method is None:
+            if self.params:
+                raise ValueError(
+                    "fusion.params 只搭配 method: custom 使用;"
+                    "內建融合直接寫 group_by / strategy / top_k"
+                )
+            return self
+        if self.method != "custom":
+            raise ValueError(
+                f"fusion 的 method 目前只支援 'custom'(收到 '{self.method}');"
+                "內建融合請省略 method,直接寫 group_by / strategy / top_k"
+            )
+        if flat_given:
+            listed = ", ".join(sorted(flat_given))
+            raise ValueError(
+                f"fusion 同時設定了 method: custom 與內建參數({listed});"
+                "custom 元件的行為由 params.init_params 決定,請移除內建參數"
+            )
+        return self
 
 
 class InferenceConfig(BaseModel):

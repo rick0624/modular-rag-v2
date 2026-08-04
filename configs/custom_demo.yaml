@@ -1,6 +1,8 @@
 # Custom module 示範配置:query_transformation / retrieval / reranking /
-# routing / generation 五個槽位都掛 examples/custom_modules/ 下的自訂元件
-# (公司系統整合的骨架)。
+# routing / generation / fusion 以及 parsing 鏈中的文件處理器都掛
+# examples/custom_modules/ 下的自訂元件(公司系統整合的骨架)。
+# ingestion 端(import / parsing 鏈首 / chunking)的 custom 示範另見
+# configs/custom_ingestion_demo.yaml。
 #
 # 完全離線可跑(mock embedding + in_memory + 骨架元件的離線回覆):
 #
@@ -24,8 +26,16 @@ ingestion:
     params:
       input_dir: ./data/raw
       extensions: [".txt", ".md"]
-  parsing:
-    method: plain_text
+  parsing:                          # custom 也能放進 parsing 鏈(鏈中 =
+    method: [plain_text, custom]    # 文件處理器,契約 documents → documents)
+    method_params:
+      plain_text: {}
+      custom:
+        file: examples/custom_modules/company_parser.py
+        class: CompanyBoilerplateCleaner
+        # kind: doc_processor       # 預設;鏈首 converter 見 custom_ingestion_demo
+        # init_params:
+        #   patterns: [本文件為公司內部機密]
   chunking:
     method: fixed_size
     params:
@@ -68,6 +78,16 @@ inference:
       class: KeywordOverlapReranker
       init_params:
         top_k: 3
+
+  fusion:
+    method: custom                  # 契約:results: list[list[Document]]
+    params:                         #      → documents: list[Document]
+      file: examples/custom_modules/company_fusion.py
+      class: CompanyFusion
+      init_params:
+        top_k: 3
+    # 注意:掛了 custom 就一律執行(單一查詢也進元件);內建融合改寫
+    # group_by / strategy / top_k(不可與 method: custom 混用)
 
   routing:                          # 獨立支線:判斷類別,不影響檢索
     method: custom                  # 契約:query: str → route: dict

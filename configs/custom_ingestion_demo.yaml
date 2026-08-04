@@ -1,0 +1,67 @@
+# Ingestion custom module 示範配置:import / parsing(鏈首 converter)/
+# chunking 三個槽位都掛 examples/custom_modules/ 下的自訂元件 ——
+# 模擬「文件來自公司 API(不落地成檔案)、信封格式自行解析、切塊照
+# 公司規則」的完整路徑。inference 端刻意全用內建方法,檢索的就是
+# custom ingestion 建出來的本地索引。
+#
+# 完全離線可跑(假 API 文件 + mock embedding + in_memory + mock 生成):
+#
+#   python scripts/run_demo.py --config configs/custom_ingestion_demo.yaml \
+#       --query "請假要提前幾天申請?" --trace
+#
+# 注意:
+# - custom module 的 file 路徑相對於「執行目錄」(repo 根)解析。
+# - custom import 回傳的是 ByteStream(非本地路徑),搭配
+#   indexing.params.incremental: true 時檔案層增量會退化為每次全量
+#   重 parse(切片層增量仍會跳過內容未變的 embedding)。
+# - ingestion 端 custom 的 .py **檔案內容**會進 ingestion 指紋:改了
+#   解析 / 切塊邏輯,服務模式的 /reload 會 409,請走 POST /ingest 重建。
+
+ingestion:
+  import:
+    method: custom                  # 契約:無輸入 → sources + meta(必帶 doc_id)
+    params:
+      file: examples/custom_modules/company_importer.py
+      class: CompanyApiImporter
+      content_type: text            # 供與 parsing 的相容性檢查;省略 = 跳過
+      # init_params:
+      #   base_url: https://km.example.com/api   # 接真服務時設定
+
+  parsing:
+    method: custom                  # 鏈首 converter:sources + meta → documents
+    params:
+      file: examples/custom_modules/company_parser.py
+      class: CompanyPayloadParser
+      kind: converter               # 放鏈首必須宣告(預設 doc_processor 只能放鏈中)
+      # input_content_types: [text] # 供與 import 的相容性檢查;省略 = 全收
+      # produces_pages: false       # 產生頁界時設 true(page_based chunking 的前提)
+
+  chunking:
+    method: custom                  # 契約:documents → documents(meta 逐塊複製)
+    params:
+      file: examples/custom_modules/company_chunker.py
+      class: CompanySentenceChunker
+      init_params:
+        max_chars: 120
+      # requires_pages: false       # 需要頁界時設 true
+
+  embedding:
+    method: mock
+    params:
+      dim: 32
+
+  indexing:
+    method: in_memory
+
+inference:
+  query_transformation:
+    method: normalize
+
+  retrieval:
+    method: bm25                    # 檢索的就是上面 custom ingestion 建的索引
+
+  reranking:
+    method: none
+
+  generation:
+    method: mock

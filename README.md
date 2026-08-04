@@ -22,9 +22,9 @@ Evaluation: JSONL 測試集 → 逐題查詢 → hit rate / MRR
 
 | 槽位 | 方法(粗體為預設) | 對應實作 |
 |---|---|---|
-| import | **local_file**(萬用:txt/md/pdf,`extensions` 可收窄) | 自訂 FileLister(相對路徑 doc_id) |
-| parsing | **auto**(依檔案類型分流) / plain_text / pdf / clean(鏈用);pdf 支援 `ocr: off/auto/force` | FileTypeRouter + 自訂 PdfToDocument(pypdf + rapidocr)+ DocumentCleaner |
-| chunking | **fixed_size** / structure_based / page_based / no_chunking | (Recursive)DocumentSplitter,一律字元單位 |
+| import | **local_file**(萬用:txt/md/pdf,`extensions` 可收窄) / custom | 自訂 FileLister(相對路徑 doc_id)/ 自訂元件(公司 DMS / API) |
+| parsing | **auto**(依檔案類型分流) / plain_text / pdf / clean(鏈用) / custom(鏈首或鏈中,`kind` 宣告);pdf 支援 `ocr: off/auto/force` | FileTypeRouter + 自訂 PdfToDocument(pypdf + rapidocr)+ DocumentCleaner |
+| chunking | **fixed_size** / structure_based / page_based / no_chunking / custom | (Recursive)DocumentSplitter,一律字元單位 / 自訂元件(公司切塊規則) |
 | embedding | **mock** / sentence_transformers / api_embedding | ST 整合套件 / 自訂 Flexible API embedder |
 | indexing | **in_memory** / elasticsearch(皆支援 `incremental: true` 增量 ingest) | InMemory / Elasticsearch DocumentStore |
 | query_transformation | **normalize** / passthrough / glossary / jargon_mapping / llm_rewrite / llm_decompose / custom | 自訂元件(`list[str] → list[str]`) |
@@ -32,7 +32,7 @@ Evaluation: JSONL 測試集 → 逐題查詢 → hit rate / MRR
 | reranking | **none** / similarity / api_rerank / llm / llm_fact_check / custom | ST cross-encoder / 自訂 Flexible API ranker / core LLMRanker / 自訂 LLMFactChecker |
 | generation | **mock** / openai / gateway_openai_compatible / custom(`generate_answer: false` 可跳過) | OpenAIChatGenerator / 自訂閘道 generator / 自訂元件(`messages → replies`) |
 | routing(選填槽位,省略=不做) | keyword_match / custom | 自訂 KeywordRouteClassifier;結果進 `query()` 的 `routing` key,不影響檢索 |
-| fusion(內建步驟) | rrf / concat_dedup / max_score × group_by none/doc/page | 自訂 SubqueryFusion(v1 演算法) |
+| fusion(內建步驟,可換 custom) | rrf / concat_dedup / max_score × group_by none/doc/page,或 `method: custom` | 自訂 SubqueryFusion(v1 演算法)/ 自訂元件(掛上即一律執行) |
 | evaluation | basic_retrieval_metrics | hit rate / MRR(doc_id 依名次去重) |
 
 `custom` 方法讓你把**自己的 Haystack 元件 .py 檔**掛進槽位,零框架改動
@@ -434,6 +434,11 @@ class BySentenceSplitter:
 | reranking | `query: str` + `documents: list[Document]` | `documents: list[Document]` |
 | routing | `query: str` | `route: dict[str, Any]` |
 | generation | `messages: list[ChatMessage]` | `replies: list[ChatMessage]` |
+| fusion | `results: list[list[Document]]` | `documents: list[Document]`(建議另輸出 `applied: bool`) |
+| import | (無 —— ingestion 以 `pipeline.run({})` 啟動) | `sources: list[str \| Path \| ByteStream]` + `meta: list[dict]`(**每筆必帶 `doc_id`**) |
+| parsing(鏈首,`kind: converter`) | `sources` + `meta`(同 import 輸出) | `documents: list[Document]` |
+| parsing(鏈中,`kind: doc_processor`,預設) | `documents: list[Document]` | `documents: list[Document]` |
+| chunking | `documents: list[Document]` | `documents: list[Document]`(meta 逐塊複製,`doc_id` 必須保留) |
 
 規則與慣例:
 
@@ -461,15 +466,35 @@ class BySentenceSplitter:
   `llm_fact_check` 的 `params.generator`,整條 pipeline 只走公司的推論
   服務。OpenAI 相容的閘道**不需要**寫 custom,用
   `gateway_openai_compatible` 即可。
+- **fusion 掛了 custom 就一律執行**:單一查詢(N=1)也進元件,「單查詢
+  原樣通過」的內建行為不會幫你做,由元件自己決定。建議額外輸出
+  `applied: bool` 供 trace 區分;跨子查詢的原始分數不可直接比較,
+  安全預設是名次法(RRF)。與內建參數(group_by / strategy / top_k)
+  互斥,混用會在載入時報錯。
+- **ingestion 端的相容性宣告寫在 config 參數裡**:import 的
+  `content_type`、parsing 的 `kind` / `produces_pages` /
+  `input_content_types`、chunking 的 `requires_pages` —— 建構期的相容性
+  檢查(content_type 流向、分頁需求)照常執行,省略即跳過 / 用預設。
+- **ingestion 端 custom 的 `file:` 檔案內容會進 ingestion 指紋**:改了
+  解析 / 切塊邏輯 = 索引內容過期,服務模式 `/reload` 會 409,請走
+  `POST /ingest` 重建;`incremental: true` 的檔案層 manifest 也會作廢
+  (全量重 parse)。`class_path:` 指向已安裝套件,只有路徑字串進指紋,
+  內容變更偵測不到 —— 要指紋保護就用 `file:`。另注意 `--stage inference`
+  的查詢端主機也要有同一份 `.py`,否則指紋對不上。
+- **custom import 回傳非本地路徑(ByteStream / API 參照)時**,
+  `incremental: true` 的檔案層增量無從比對雜湊,退化為每次全量重 parse
+  (會出聲警告;切片層增量仍會跳過內容未變的 embedding)。
 - embedding / indexing 槽位暫不支援 custom(factory 回傳形狀不是單一
   元件:embedding 是 document / text 一對,indexing 是 document store);
   有需求時走路 B。
 - 完整可跑的骨架見 [examples/custom_modules/](examples/custom_modules/)
-  (公司改寫 / 檢索 / 重排 / 分類 / 生成五支,`TODO(替換點)` 標明換入
-  真實邏輯的位置)與 [configs/custom_demo.yaml](configs/custom_demo.yaml):
+  (改寫 / 檢索 / 重排 / 分類 / 生成 / 融合 / 匯入 / 解析 / 切塊,
+  `TODO(替換點)` 標明換入真實邏輯的位置)與兩份示範 config:
   `python scripts/run_demo.py --config configs/custom_demo.yaml --trace`
-  (custom retrieval 不吃本地索引,所以這份 config 也能加
-  `--stage inference` 只跑查詢)
+  (inference 端 + fusion;custom retrieval 不吃本地索引,也能加
+  `--stage inference` 只跑查詢)、
+  `python scripts/run_demo.py --config configs/custom_ingestion_demo.yaml --trace`
+  (ingestion 三槽位:公司 API 匯入 → 自訂解析 → 自訂切塊)
 - 注意:custom module 就是執行任意 Python 程式碼,與 config 檔同一
   信任層級,只載入你信任的來源。
 

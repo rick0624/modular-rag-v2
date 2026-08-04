@@ -165,3 +165,43 @@ def test_query_trace_records_generation(corpus_dir):
     assert generation["answer"] == "FAISS 支援 Flat、IVF 與 HNSW。"
     assert "FAISS 支援哪些索引結構?" in generation["prompt"]
     assert generation["meta"] == result["reply_meta"]
+
+
+def test_custom_fusion_without_applied_renders_custom_branch(corpus_dir, tmp_path):
+    """custom fusion 未回報 applied:trace 為 None,排版走 custom 分支不炸。"""
+    (tmp_path / "fusion.py").write_text(
+        "from typing import Any\n"
+        "from haystack import component\n"
+        "from haystack.dataclasses import Document\n\n\n"
+        "@component\n"
+        "class SilentFusion:\n"
+        "    @component.output_types(documents=list[Document])\n"
+        "    def run(self, results: list[list[Document]]) -> dict[str, Any]:\n"
+        "        return {'documents': [d for docs in results for d in docs]}\n",
+        encoding="utf-8",
+    )
+    data = make_config(
+        ingestion={
+            "import": {
+                "method": "local_file",
+                "params": {"input_dir": str(corpus_dir), "extensions": [".txt"]},
+            },
+        },
+    )
+    data["inference"]["fusion"] = {
+        "method": "custom",
+        "params": {"file": str(tmp_path / "fusion.py"), "class": "SilentFusion"},
+    }
+    pipelines = build_pipelines(parse_config(data))
+    pipelines.run_ingestion()
+    result = pipelines.query("FAISS 支援哪些索引結構?")
+
+    assert result["trace"]["fusion"]["applied"] is None
+
+    from rag.trace import format_query_trace
+
+    joined = "\n".join(format_query_trace(result["trace"]))
+    assert "Fusion(custom 元件)" in joined
+    assert "未回報 applied" in joined
+    # 既有兩種分支的字樣不可誤現
+    assert "未啟用:原樣通過" not in joined

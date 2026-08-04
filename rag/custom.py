@@ -156,9 +156,22 @@ def _load_from_file(where: str, file: str, cls_name: str) -> type:
 
 
 def instantiate_custom(
-    slot: str, params: CustomModuleParams, *, method: str = "custom"
+    slot: str,
+    params: CustomModuleParams,
+    *,
+    method: str = "custom",
+    contract: str | None = None,
 ) -> Any:
     """載入、實例化並驗證 custom 元件(建構期一站完成)。
+
+    Args:
+        slot: 槽位名稱(進錯誤訊息前綴)。
+        params: 已驗證的 custom module 參數。
+        method: 方法名稱(進錯誤訊息前綴)。
+        contract: 用哪份 :data:`rag.contracts.SLOT_CONTRACTS` 契約驗證;
+            None 時用 ``slot`` 本身。同一槽位有多種形狀時用
+            (parsing 依 kind 選 "parsing" / "parsing_converter",
+            錯誤訊息前綴仍是槽位名稱)。
 
     Raises:
         ConfigError: 載入失敗、建構子參數不符,或 socket 契約不滿足。
@@ -184,6 +197,8 @@ def instantiate_custom(
         ) from exc
 
     validate_component_contract(
-        slot, instance, where=f"模組 '{slot}' 方法 '{method}'(類別 {cls.__name__})"
+        contract or slot,
+        instance,
+        where=f"模組 '{slot}' 方法 '{method}'(類別 {cls.__name__})",
     )
     return instance

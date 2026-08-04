@@ -21,11 +21,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from haystack.dataclasses import ChatMessage, Document
+from haystack.dataclasses import ByteStream, ChatMessage, Document
 
 from rag.errors import ConfigError
+
+# import 輸出 / parsing 鏈首輸入的 sources 型別:與 Haystack converter 的
+# sources 參數同款 union。契約用它當 receiver 側規格,custom 元件註記
+# list[str] / list[Path] / list[ByteStream] 都相容;但**不可**改成
+# list[Any] —— sender 端的 list[Any] 對任何具體型別都不相容(strict-Any)。
+_SOURCES_TYPE = list[str | Path | ByteStream]
+_META_TYPE = list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -77,6 +85,46 @@ SLOT_CONTRACTS: dict[str, SlotContract] = {
         slot="generation",
         inputs=(SocketSpec("messages", list[ChatMessage]),),
         outputs=(SocketSpec("replies", list[ChatMessage]),),
+    ),
+    # fusion:跨子查詢的合併步驟。掛了 custom 就一律執行(單一查詢的
+    # N=1 也進元件,原樣通過與否由元件決定);建議額外輸出 applied: bool
+    # (trace 用之區分「融合過」與「路過」,缺席時顯示為未回報)。
+    "fusion": SlotContract(
+        slot="fusion",
+        inputs=(SocketSpec("results", list[list[Document]]),),
+        outputs=(SocketSpec("documents", list[Document]),),
+    ),
+    # import:pipeline 的最上游,以 pipeline.run({}) 啟動 —— 沒有任何輸入
+    # (空契約 + 「契約外必填輸入拒絕」= 任何必填輸入都會被擋)。
+    # meta 的每個元素**必須帶 doc_id**(socket 驗不到;執行期由
+    # ChunkMetaStamper 兜底報錯)。
+    "import": SlotContract(
+        slot="import",
+        inputs=(),
+        outputs=(
+            SocketSpec("sources", _SOURCES_TYPE),
+            SocketSpec("meta", _META_TYPE),
+        ),
+    ),
+    # parsing 有兩種位置、兩份契約:鏈中的文件處理器(預設)與鏈首的
+    # converter(params 設 kind: converter 時採用,見 "parsing_converter")。
+    "parsing": SlotContract(
+        slot="parsing",
+        inputs=(SocketSpec("documents", list[Document]),),
+        outputs=(SocketSpec("documents", list[Document]),),
+    ),
+    "parsing_converter": SlotContract(
+        slot="parsing_converter",
+        inputs=(
+            SocketSpec("sources", _SOURCES_TYPE),
+            SocketSpec("meta", _META_TYPE),
+        ),
+        outputs=(SocketSpec("documents", list[Document]),),
+    ),
+    "chunking": SlotContract(
+        slot="chunking",
+        inputs=(SocketSpec("documents", list[Document]),),
+        outputs=(SocketSpec("documents", list[Document]),),
     ),
 }
 
@@ -173,11 +221,17 @@ def validate_component_contract(slot: str, instance: Any, *, where: str) -> None
     )
     if extra_mandatory:
         listed = ", ".join(repr(name) for name in extra_mandatory)
-        raise ConfigError(
-            f"{where}:有契約以外的必填輸入 socket {listed}。"
+        provided = (
             f"槽位 '{slot}' 執行時只會提供 "
             f"{', '.join(repr(s.name) for s in contract.inputs)},"
-            "其他輸入沒有上游可餵。請在 run() 給這些參數預設值,"
+            "其他輸入沒有上游可餵。"
+            if contract.inputs
+            else f"槽位 '{slot}' 不提供任何輸入"
+            "(ingestion 以 pipeline.run({}) 啟動,元件必須能無輸入執行)。"
+        )
+        raise ConfigError(
+            f"{where}:有契約以外的必填輸入 socket {listed}。"
+            f"{provided}請在 run() 給這些參數預設值,"
             "或改為 __init__ 參數並經由 init_params 設定"
         )
 
