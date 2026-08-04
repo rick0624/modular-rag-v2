@@ -447,6 +447,13 @@ class BySentenceSplitter:
   才能直接運作。
 - custom 可出現在方法鏈中(`method: [normalize, custom]`),但同一條鏈
   只能有一個 `custom`(需要兩個時把邏輯合併成一個元件,或走路 B)。
+- **log 要看得到**:`logging.getLogger(__name__)` 在 `file:` 載入時可用
+  (模組掛在框架設成 DEBUG 的 `_rag_custom.*` 底下),但 `class_path:`
+  載入時模組名是你自己的套件路徑,層級會繼承 root(`--log-level`,預設
+  WARNING)—— INFO / DEBUG 在**發出當下**就被丟掉,連 log 檔的 DEBUG
+  handler 都輪不到。兩種載入方式都想要紀錄,就把 logger 命名在 `rag.*`
+  底下:`logging.getLogger("rag.custom.my_transform")`(範例骨架都是這樣
+  寫的)。這樣終端機仍只印 WARNING 以上,細節照樣進 log 檔。
 - **generation 的 custom 是「換掉 LLM 客戶端」,不是換掉 prompt 組裝**:
   契約就是 Haystack 的 ChatGenerator 形狀,`prompt_template` /
   `system_prompt` 照常寫在 YAML,元件收到的是框架組好的 messages。

@@ -3,23 +3,29 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import pytest
 
-from rag.logging_config import default_log_path, setup_logging
+from rag.custom import CUSTOM_MODULE_PACKAGE, CustomModuleParams, instantiate_custom
+from rag.logging_config import _PROJECT_LOGGERS, default_log_path, setup_logging
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture(autouse=True)
 def _restore_logging():
     """測試會動到 root handler,跑完還原,避免污染其他測試。"""
     root = logging.getLogger()
-    saved = list(root.handlers), root.level, logging.getLogger("rag").level
+    saved_levels = {name: logging.getLogger(name).level for name in _PROJECT_LOGGERS}
+    saved = list(root.handlers), root.level
     yield
     for handler in list(root.handlers):
         root.removeHandler(handler)
         handler.close()
     root.handlers, root.level = saved[0], saved[1]
-    logging.getLogger("rag").setLevel(saved[2])
+    for name, level in saved_levels.items():
+        logging.getLogger(name).setLevel(level)
 
 
 def test_file_gets_debug_while_console_stays_quiet(tmp_path, capsys):
@@ -79,6 +85,52 @@ def test_muted_dependency_errors_still_reach_console(tmp_path, capsys):
     setup_logging(tmp_path / "run.log")
     logging.getLogger("huggingface_hub").error("下載失敗")
     assert "下載失敗" in capsys.readouterr().err
+
+
+class TestCustomModuleLogging:
+    """custom module 的紀錄要進 log 檔 —— 靜默失效是最難查的問題。"""
+
+    def test_project_logger_list_matches_custom_module_package(self):
+        """對映 rag.custom 的模組命名;改了那邊沒改這邊 = 紀錄再次消失。"""
+        assert CUSTOM_MODULE_PACKAGE in _PROJECT_LOGGERS
+
+    def test_file_loaded_module_logger_reaches_log_file(self, tmp_path, capsys):
+        """``file:`` 載入的模組寫 getLogger(__name__),名字在 _rag_custom.* 底下。
+
+        沒有把這棵樹設成 DEBUG 的話,INFO 會繼承 root 的 WARNING 在發出當下
+        就被丟掉,連 log 檔的 DEBUG handler 都輪不到。
+        """
+        path = setup_logging(tmp_path / "run.log", console_level="WARNING")
+        logger = logging.getLogger(f"{CUSTOM_MODULE_PACKAGE}.my_transform_ab12cd34")
+
+        logger.debug("每條查詢的改寫結果")
+        logger.info("custom module 收到 2 條查詢")
+
+        content = path.read_text(encoding="utf-8")
+        assert "custom module 收到 2 條查詢" in content
+        assert "每條查詢的改寫結果" in content
+        # 終端機照舊只留 WARNING 以上(log 檔完整 ≠ 終端機吵)
+        assert "custom module 收到 2 條查詢" not in capsys.readouterr().err
+
+    def test_rag_custom_naming_convention_also_works(self, tmp_path):
+        """``class_path:`` 載入時模組名任意,慣例是自己命名在 rag.custom.* 底下。"""
+        path = setup_logging(tmp_path / "run.log")
+        logging.getLogger("rag.custom.query_expander").info("擴充後的查詢")
+        assert "擴充後的查詢" in path.read_text(encoding="utf-8")
+
+    def test_real_example_module_logs(self, tmp_path, monkeypatch):
+        """實地驗一次 examples/ 的骨架:載入後呼叫 run(),紀錄要出現在檔案裡。"""
+        monkeypatch.chdir(REPO_ROOT)
+        path = setup_logging(tmp_path / "run.log")
+        component = instantiate_custom(
+            "query_transformation",
+            CustomModuleParams(
+                file="examples/custom_modules/company_query_transform.py",
+                **{"class": "CompanyQueryExpander"},
+            ),
+        )
+        component.run(queries=["請假規則?"])
+        assert "CompanyQueryExpander" in path.read_text(encoding="utf-8")
 
 
 def test_default_path_is_timestamped_under_logs():

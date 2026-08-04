@@ -25,6 +25,17 @@ _CONSOLE_MUTED = ("huggingface_hub", "py.warnings")
 # 進度條,root 一降級終端機就跑出一堆 "Batches: 100%|…"。
 _FILE_VERBOSE = ("httpx", "openai", "elastic_transport", "haystack")
 
+# 與本專案同等對待(一律 DEBUG)的 logger 樹:
+# - "rag":框架自己的元件,以及刻意掛在底下的 CLI logger(rag.demo…)。
+# - "_rag_custom":``file:`` 載入的 custom module —— 模組名由
+#   :data:`rag.custom.CUSTOM_MODULE_PACKAGE` 決定,不在 "rag" 底下,
+#   沒有這一條的話使用者寫的 ``logging.getLogger(__name__)`` 會繼承 root
+#   的層級(預設 WARNING),INFO / DEBUG 在發出當下就被丟掉,連 log 檔的
+#   DEBUG handler 都輪不到 —— 靜默失效,最難查。
+#   ``class_path:`` 載入的模組名稱是任意套件路徑,框架蓋不到,慣例是把
+#   logger 命名在 "rag.custom.*" 底下(見 README「自訂方法」)。
+_PROJECT_LOGGERS = ("rag", "_rag_custom")
+
 
 class _MuteNoisyDeps(logging.Filter):
     """終端機端過濾:指定套件低於 ERROR 的訊息不印。"""
@@ -66,9 +77,10 @@ def setup_logging(
 ) -> Path | None:
     """設定終端機與(選填)檔案兩路日誌。
 
-    ``rag.*`` 一律開到 DEBUG(LLM 的 prompt / 回覆就在這一層),由各
-    handler 自己的層級決定印不印;第三方套件在有 log 檔時開到 INFO
-    —— httpx 的請求紀錄有用,但它們的 DEBUG 會把檔案灌爆。
+    ``rag.*`` 與 ``_rag_custom.*``(``file:`` 載入的 custom module)一律
+    開到 DEBUG(LLM 的 prompt / 回覆就在這一層),由各 handler 自己的層級
+    決定印不印;第三方套件在有 log 檔時開到 INFO —— httpx 的請求紀錄有用,
+    但它們的 DEBUG 會把檔案灌爆。
 
     Args:
         log_file: log 檔路徑;``None`` 表示不寫檔。父目錄會自動建立。
@@ -82,7 +94,8 @@ def setup_logging(
         root.removeHandler(handler)
         handler.close()
     root.setLevel(getattr(logging, console_level))
-    logging.getLogger("rag").setLevel(logging.DEBUG)
+    for name in _PROJECT_LOGGERS:
+        logging.getLogger(name).setLevel(logging.DEBUG)
     for name in _FILE_VERBOSE:
         logging.getLogger(name).setLevel(logging.INFO if log_file else logging.NOTSET)
 

@@ -26,7 +26,9 @@ from typing import Any
 from haystack import component
 from haystack.dataclasses import Document
 
-logger = logging.getLogger(__name__)
+# logger 命名在 "rag.*" 底下:file: 與 class_path: 兩種載入方式都吃得到
+# 框架的 log 檔設定(見 README「自訂方法」的「log 要看得到」)。
+logger = logging.getLogger("rag.custom.company_retrieval")
 
 # 模擬的公司知識庫(TODO(替換點):接上真正的服務後整段刪除)。
 _FAKE_CORPUS: list[dict[str, Any]] = [
