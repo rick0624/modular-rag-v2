@@ -15,7 +15,10 @@ fastapi = pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from rag.service import create_app  # noqa: E402
+from rag.config import load_raw_config  # noqa: E402
+from rag.errors import ConfigError  # noqa: E402
+from rag.kb_meta import ingestion_fingerprint  # noqa: E402
+from rag.service import create_app, ingest_only  # noqa: E402
 
 
 def _service_config(corpus_dir, **overrides):
@@ -146,11 +149,45 @@ def test_ingest_is_the_sanctioned_path_for_ingestion_change(service):
     assert client.post("/reload").status_code == 200
 
 
-def test_skip_ingest_starts_with_empty_index(tmp_path, corpus_dir):
+def test_stage_inference_starts_with_empty_index(tmp_path, corpus_dir):
     path = _write_config(tmp_path, _service_config(corpus_dir))
-    client = TestClient(create_app(path, skip_ingest=True))
+    client = TestClient(create_app(path, stage="inference"))
     body = client.post("/query", json={"query": "FAISS?"}).json()
     assert body["documents"] == []  # in_memory + 跳過 ingest = 空索引,不炸
+
+
+def test_stage_inference_still_allows_ingest_endpoint(tmp_path, corpus_dir):
+    """啟動時沒建 ingestion pipeline,POST /ingest 仍是重建索引的正道。"""
+    path = _write_config(tmp_path, _service_config(corpus_dir))
+    client = TestClient(create_app(path, stage="inference"))
+    assert client.post("/ingest").json()["documents_written"] > 0
+    assert client.post("/query", json={"query": "FAISS?"}).json()["documents"]
+
+
+class TestIngestOnly:
+    """``serve.py --stage ingestion``:只建索引、不開服務。"""
+
+    def test_builds_index_and_stamps_fingerprint(self, tmp_path, corpus_dir):
+        path = _write_config(tmp_path, _service_config(corpus_dir))
+        result = ingest_only(path)
+
+        assert result["writer"]["documents_written"] > 0
+        assert len(result["fingerprint"]) == 64
+        # 指紋與 create_app 算出來的是同一個(兩個 process 之間的握手)
+        assert result["fingerprint"] == ingestion_fingerprint(load_raw_config(path))
+
+    def test_inference_pipeline_is_not_built(self, tmp_path, corpus_dir):
+        """reranker 等 inference 側元件不該被載入 —— 用不存在的方法驗證。"""
+        data = _service_config(corpus_dir)
+        data["inference"]["reranking"] = {"method": "does_not_exist"}
+        path = _write_config(tmp_path, data)
+        # inference 有錯也不影響只建索引(建構期根本沒碰 inference 槽位)
+        assert ingest_only(path)["writer"]["documents_written"] > 0
+
+    def test_create_app_rejects_ingestion_stage_with_pointer(self, tmp_path, corpus_dir):
+        path = _write_config(tmp_path, _service_config(corpus_dir))
+        with pytest.raises(ConfigError, match="ingest_only"):
+            create_app(path, stage="ingestion")
 
 
 def test_reload_with_invalid_config_returns_400(service):

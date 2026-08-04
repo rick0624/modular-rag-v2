@@ -78,9 +78,9 @@ def test_custom_demo_query_transformation_chain(corpus_dir, monkeypatch):
 
 
 def test_custom_demo_runs_inference_only(corpus_dir, monkeypatch):
-    """custom retrieval 不吃本地索引 → 這份 config 支援 --skip-ingest。"""
+    """custom retrieval 不吃本地索引 → 這份 config 支援 --stage inference。"""
     monkeypatch.chdir(REPO_ROOT)
-    pipelines = build_pipelines(load_demo_config(corpus_dir), skip_ingestion=True)
+    pipelines = build_pipelines(load_demo_config(corpus_dir), stage="inference")
 
     assert pipelines.ingestion is None
     result = pipelines.query("請假規則怎麼申請?")

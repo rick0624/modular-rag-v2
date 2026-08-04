@@ -85,6 +85,9 @@ logger = logging.getLogger(__name__)
 # 輸入輸出同型別、支援方法鏈(method 清單)的槽位。
 CHAINABLE_SLOTS = frozenset({"parsing", "query_transformation", "reranking"})
 
+# build_pipelines(stage=…) 可組的階段。順序即 CLI 的顯示順序。
+PIPELINE_STAGES: tuple[str, ...] = ("all", "ingestion", "inference")
+
 
 # ---------------------------------------------------------------------------
 # 基礎設施:SlotFactory / BuildContext / 參數驗證
@@ -1579,25 +1582,28 @@ def _load_native_pipeline(path: str) -> Pipeline:
 class RagPipelines:
     """一組建好的 pipelines(共用同一個 document store)。
 
-    ``ingestion`` 為 ``None`` 代表這組 pipelines 是以
-    ``build_pipelines(..., skip_ingestion=True)`` 建的(只組 inference,
-    索引沿用既有內容);此時 :meth:`run_ingestion` 會報錯。
+    ``stage`` 記錄這組是為哪個階段建的(見 :func:`build_pipelines`):
+    ``"ingestion"`` 時 ``inference`` 為 ``None``、``"inference"`` 時
+    ``ingestion`` 為 ``None``,對應的 :meth:`run_ingestion` / :meth:`query`
+    會報錯並指明要怎麼重建 —— 半條 pipeline 被誤用時,錯在建構意圖上,
+    不該讓它變成執行期一個難解的 KeyError。
     """
 
     config: RAGConfig
     ingestion: Pipeline | None
-    inference: Pipeline
+    inference: Pipeline | None
     store: Any
     query_entry: tuple[str, str] | None = None
     generate_answer: bool = True
     transform_names: list[str] = dc_field(default_factory=list)
     routing_enabled: bool = False
+    stage: str = "all"
 
     def run_ingestion(self) -> dict[str, Any]:
         """執行 ingestion(來源資訊已在 config 中)。
 
         Raises:
-            ConfigError: 這組 pipelines 以 ``skip_ingestion=True`` 建立,
+            ConfigError: 這組 pipelines 以 ``stage="inference"`` 建立,
                 沒有 ingestion pipeline 可執行。
 
         Returns:
@@ -1608,9 +1614,9 @@ class RagPipelines:
         """
         if self.ingestion is None:
             raise ConfigError(
-                "這組 pipelines 以 skip_ingestion=True 建立(只組了 inference),"
-                "沒有 ingestion pipeline 可執行。需要建索引請改用 "
-                "build_pipelines(config)(不帶 skip_ingestion)"
+                f"這組 pipelines 以 stage='{self.stage}' 建立,沒有 ingestion "
+                "pipeline 可執行。需要建索引請改用 "
+                "build_pipelines(config, stage='ingestion')(或 stage='all')"
             )
         step_names = step_order(self.ingestion)
         result = self.ingestion.run({}, include_outputs_from=set(step_names))
@@ -1697,10 +1703,17 @@ class RagPipelines:
                 }
 
         Raises:
-            ConfigError: inference 由原生 Haystack YAML 載入
-                (query() 便利介面只支援槽位式配置,請直接呼叫
+            ConfigError: 這組 pipelines 以 ``stage="ingestion"`` 建立
+                (沒有 inference pipeline),或 inference 由原生 Haystack
+                YAML 載入(query() 便利介面只支援槽位式配置,請直接呼叫
                 ``.inference.run(...)``)。
         """
+        if self.inference is None:
+            raise ConfigError(
+                f"這組 pipelines 以 stage='{self.stage}' 建立,沒有 inference "
+                "pipeline 可查詢。需要查詢請改用 "
+                "build_pipelines(config, stage='inference')(或 stage='all')"
+            )
         if self.query_entry is None:
             raise ConfigError(
                 "inference pipeline 由原生 Haystack YAML 載入,"
@@ -1766,7 +1779,7 @@ class RagPipelines:
 
 
 def build_pipelines(
-    config: RAGConfig, *, store: Any = None, skip_ingestion: bool = False
+    config: RAGConfig, *, store: Any = None, stage: str = "all"
 ) -> RagPipelines:
     """把整份配置翻譯成可執行的 pipelines(含 escape hatch 處理)。
 
@@ -1776,41 +1789,56 @@ def build_pipelines(
     Args:
         config: 已驗證的整體配置。
         store: 既有的 document store;None 時依 ``indexing`` 槽位建立。
-        skip_ingestion: 只組 inference(``ingestion`` 為 ``None``,
-            :meth:`RagPipelines.run_ingestion` 會報錯)。**只調整要不要建
-            那條 pipeline,不改變 inference 的組法** —— 用於「只測 inference」
-            的迭代:索引已建好(elasticsearch)、或 retrieval 走 custom 外部
-            檢索不吃本地索引時,省掉 ingestion 側元件(如 document embedder
-            的模型載入)與來源資料夾必須存在的前提。
+        stage: 要組哪些階段。**只決定建不建那條 pipeline,不改變任何一條
+            的組法**,因此半條與整條的行為完全一致:
+
+            - ``"all"``(預設):兩條都組。
+            - ``"ingestion"``:只建索引。省掉 inference 側元件(reranker
+              的 cross-encoder、查詢端 embedder…)的載入;:meth:`RagPipelines.query`
+              會報錯。
+            - ``"inference"``:只查詢,索引沿用既有內容。省掉 ingestion
+              側元件(document embedder…)與「來源資料夾必須存在」的前提;
+              :meth:`RagPipelines.run_ingestion` 會報錯。適用於索引已建好
+              (elasticsearch)、或 retrieval 走 custom 外部檢索時。
+
+    Raises:
+        ConfigError: ``stage`` 不是上述三者之一。
 
     注意:escape hatch 的 ingestion + 槽位式 inference 只在索引為外部
     服務(如 elasticsearch)時有意義 —— in_memory store 無法跨 pipeline
     共享原生 pipeline 寫入的內容。
     """
+    if stage not in PIPELINE_STAGES:
+        raise ConfigError(
+            f"未知的 stage '{stage}';可用的值:"
+            f"{', '.join(repr(s) for s in PIPELINE_STAGES)}"
+        )
     native = config.haystack_pipelines
-    ingestion_pipeline: Pipeline | None
-    if skip_ingestion:
-        ingestion_pipeline = None
-    elif native is not None and native.ingestion is not None:
-        ingestion_pipeline = _load_native_pipeline(native.ingestion)
-    else:
-        ingestion_pipeline, store = build_ingestion_pipeline(config, store=store)
 
+    ingestion_pipeline: Pipeline | None = None
+    if stage != "inference":
+        if native is not None and native.ingestion is not None:
+            ingestion_pipeline = _load_native_pipeline(native.ingestion)
+        else:
+            ingestion_pipeline, store = build_ingestion_pipeline(config, store=store)
+
+    inference_pipeline: Pipeline | None = None
     query_entry: tuple[str, str] | None = None
     generate_answer = True
     transform_names: list[str] = []
     routing_enabled = False
-    if native is not None and native.inference is not None:
-        inference_pipeline = _load_native_pipeline(native.inference)
-    else:
-        inference_pipeline, meta = build_inference_pipeline(config, store=store)
-        # skip_ingestion 時 store 是 inference 側依 indexing 槽位建的,
-        # 要收回來(kb_meta 的指紋 / manifest 都掛在 store 上)。
-        store = meta["store"]
-        query_entry = meta["query_entry"]
-        generate_answer = meta["generate_answer"]
-        transform_names = meta["transform_names"]
-        routing_enabled = meta["routing_enabled"]
+    if stage != "ingestion":
+        if native is not None and native.inference is not None:
+            inference_pipeline = _load_native_pipeline(native.inference)
+        else:
+            inference_pipeline, meta = build_inference_pipeline(config, store=store)
+            # stage="inference" 時 store 是 inference 側依 indexing 槽位建的,
+            # 要收回來(kb_meta 的指紋 / manifest 都掛在 store 上)。
+            store = meta["store"]
+            query_entry = meta["query_entry"]
+            generate_answer = meta["generate_answer"]
+            transform_names = meta["transform_names"]
+            routing_enabled = meta["routing_enabled"]
     return RagPipelines(
         config=config,
         ingestion=ingestion_pipeline,
@@ -1820,4 +1848,5 @@ def build_pipelines(
         generate_answer=generate_answer,
         transform_names=transform_names,
         routing_enabled=routing_enabled,
+        stage=stage,
     )

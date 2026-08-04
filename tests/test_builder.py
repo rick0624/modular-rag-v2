@@ -343,8 +343,41 @@ class TestSkipGeneration:
         assert "ranker" in inner.to_dict()["components"]
 
 
-class TestSkipIngestion:
-    """``skip_ingestion=True``:只組 inference(run_demo.py --skip-ingest)。"""
+class TestStageSelection:
+    """``stage=…``:只組其中一段(run_demo.py / serve.py 的 --stage)。"""
+
+    @staticmethod
+    def _config(corpus_dir):
+        return parse_config(
+            make_config(
+                ingestion={
+                    "import": {
+                        "method": "local_file",
+                        "params": {
+                            "input_dir": str(corpus_dir),
+                            "extensions": [".txt"],
+                        },
+                    }
+                }
+            )
+        )
+
+    def test_only_ingestion_is_built(self, corpus_dir):
+        pipelines = build_pipelines(self._config(corpus_dir), stage="ingestion")
+        assert pipelines.inference is None
+        assert pipelines.query_entry is None
+        # 索引照建(store 由 ingestion 側建立並回收)
+        assert pipelines.run_ingestion()["writer"]["documents_written"] > 0
+        assert pipelines.store.count_documents() > 0
+
+    def test_query_refuses_and_points_at_fix(self, corpus_dir):
+        pipelines = build_pipelines(self._config(corpus_dir), stage="ingestion")
+        with pytest.raises(ConfigError, match="stage='ingestion'"):
+            pipelines.query("向量檢索")
+
+    def test_unknown_stage_lists_options(self, corpus_dir):
+        with pytest.raises(ConfigError, match="'all', 'ingestion', 'inference'"):
+            build_pipelines(self._config(corpus_dir), stage="ingest")
 
     def test_only_inference_is_built(self, corpus_dir):
         config = parse_config(
@@ -360,7 +393,7 @@ class TestSkipIngestion:
                 }
             )
         )
-        pipelines = build_pipelines(config, skip_ingestion=True)
+        pipelines = build_pipelines(config, stage="inference")
         assert pipelines.ingestion is None
         assert pipelines.store is not None  # inference 端自行依 indexing 建
         assert pipelines.query_entry is not None
@@ -369,8 +402,8 @@ class TestSkipIngestion:
 
     def test_run_ingestion_refuses_and_points_at_fix(self, corpus_dir):
         config = parse_config(make_config())
-        pipelines = build_pipelines(config, skip_ingestion=True)
-        with pytest.raises(ConfigError, match="skip_ingestion=True"):
+        pipelines = build_pipelines(config, stage="inference")
+        with pytest.raises(ConfigError, match="stage='inference'"):
             pipelines.run_ingestion()
 
     def test_missing_source_dir_is_not_touched(self, tmp_path):
@@ -388,7 +421,7 @@ class TestSkipIngestion:
                 }
             )
         )
-        pipelines = build_pipelines(config, skip_ingestion=True)
+        pipelines = build_pipelines(config, stage="inference")
         assert pipelines.ingestion is None
 
     def test_default_still_builds_ingestion(self, corpus_dir):

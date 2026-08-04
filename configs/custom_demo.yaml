@@ -8,7 +8,7 @@
 #
 # custom retrieval 不吃本地索引,所以這份 config 也可以只跑 inference:
 #
-#   python scripts/run_demo.py --config configs/custom_demo.yaml --skip-ingest
+#   python scripts/run_demo.py --config configs/custom_demo.yaml --stage inference
 #
 # 注意:custom module 的 file 路徑相對於「執行目錄」(repo 根)解析,
 # 不是 config 檔的位置。到公司整合時,把這幾支 .py 裡標了
