@@ -15,7 +15,8 @@
 ```
 Ingestion:  Import → Parsing → Chunking → (身分蓋章) → Embedding → Indexing
 Inference:  查詢 → Query Transformation 鏈 → 多子查詢檢索(檢索 → 重排)
-            → 融合/聚合 → Prompt → Generation
+            → 融合/聚合 ─┬→ Prompt → Generation
+            │            └→ Formatter(選填終端支線:對外格式,進輸出的 output key)
             └→ Routing(選填獨立支線:查詢分類,結果附加於輸出)
 Evaluation: JSONL 測試集 → 逐題查詢 → hit rate / MRR
 ```
@@ -32,6 +33,7 @@ Evaluation: JSONL 測試集 → 逐題查詢 → hit rate / MRR
 | reranking | **none** / similarity / api_rerank / llm / llm_fact_check / custom | ST cross-encoder / 自訂 Flexible API ranker / core LLMRanker / 自訂 LLMFactChecker |
 | generation | **mock** / openai / gateway_openai_compatible / custom(`generate_answer: false` 可跳過) | OpenAIChatGenerator / 自訂閘道 generator / 自訂元件(`messages → replies`) |
 | routing(選填槽位,省略=不做) | keyword_match / custom | 自訂 KeywordRouteClassifier;結果進 `query()` 的 `routing` key,不影響檢索 |
+| formatter(選填槽位,省略=不做) | simple_json / custom | 終端支線:最終結果組成對外格式,進 `query()` 的 `output` key;canonical 鍵照舊 |
 | fusion(內建步驟,可換 custom) | rrf / concat_dedup / max_score × group_by none/doc/page,或 `method: custom` | 自訂 SubqueryFusion(v1 演算法)/ 自訂元件(掛上即一律執行) |
 | evaluation | basic_retrieval_metrics | hit rate / MRR(doc_id 依名次去重) |
 
@@ -439,6 +441,7 @@ class BySentenceSplitter:
 | parsing(鏈首,`kind: converter`) | `sources` + `meta`(同 import 輸出) | `documents: list[Document]` |
 | parsing(鏈中,`kind: doc_processor`,預設) | `documents: list[Document]` | `documents: list[Document]` |
 | chunking | `documents: list[Document]` | `documents: list[Document]`(meta 逐塊複製,`doc_id` 必須保留) |
+| formatter | `documents: list[Document]` + `query: str` | `payload: Any`(**終端槽位特權**:型別自由,元件仍須宣告實際的具體型別) |
 
 規則與慣例:
 
@@ -471,6 +474,11 @@ class BySentenceSplitter:
   `applied: bool` 供 trace 區分;跨子查詢的原始分數不可直接比較,
   安全預設是名次法(RRF)。與內建參數(group_by / strategy / top_k)
   互斥,混用會在載入時報錯。
+- **formatter 的信封固定、內容自由**:槽位位置(fusion 之後的終端支線,
+  與 prompt → generation 並聯)、socket 名稱(`payload`)與 `query()` 的
+  鍵(`output`)固定,payload 的型別由元件自己決定(dict / str / 自訂
+  類別)—— 這是終端槽位的特權,圖上沒有下游接它;中間槽位不可模仿。
+  走 HTTP(`/query` 回應的 `output` 欄位)時 payload 必須 JSON 可序列化。
 - **ingestion 端的相容性宣告寫在 config 參數裡**:import 的
   `content_type`、parsing 的 `kind` / `produces_pages` /
   `input_content_types`、chunking 的 `requires_pages` —— 建構期的相容性
@@ -488,7 +496,7 @@ class BySentenceSplitter:
   元件:embedding 是 document / text 一對,indexing 是 document store);
   有需求時走路 B。
 - 完整可跑的骨架見 [examples/custom_modules/](examples/custom_modules/)
-  (改寫 / 檢索 / 重排 / 分類 / 生成 / 融合 / 匯入 / 解析 / 切塊,
+  (改寫 / 檢索 / 重排 / 分類 / 生成 / 融合 / 匯入 / 解析 / 切塊 / 格式化,
   `TODO(替換點)` 標明換入真實邏輯的位置)與兩份示範 config:
   `python scripts/run_demo.py --config configs/custom_demo.yaml --trace`
   (inference 端 + fusion;custom retrieval 不吃本地索引,也能加

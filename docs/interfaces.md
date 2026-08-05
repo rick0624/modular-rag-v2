@@ -77,6 +77,7 @@ Evaluation: JSONL 測試集 → 逐題 RagPipelines.query() → hit_rate / MRR
 | generation | ChatPromptBuilder 的 messages → `replies: [ChatMessage]`;`generate_answer: false` 時整段省略(此時 generation 區塊選填,僅作 LLM 沿用來源) | ✗ |
 | routing(選填槽位) | `query: str` → `route: dict[str, Any]`(圖上無下游;route 內容自由,慣例含 `category`) | ✗ |
 | fusion(內建步驟,可換 custom) | `list[list[Document]]` → `list[Document]`(非槽位;`inference.fusion` 設定,`method: custom` 可換自訂元件 —— 掛上即一律執行) | — |
+| formatter(選填槽位) | `documents` + `query: str` → `payload: Any`(fusion 之後的終端支線,與 prompt → generation 並聯;payload 進 `query()` 的 `output` key,圖上無下游) | ✗ |
 
 ## 4. 相容性宣告(建構期檢查)
 
@@ -130,6 +131,7 @@ custom 元件無宣告可查,建構期直接檢視
 | parsing(`kind: doc_processor`,預設;契約鍵 `parsing`) | `documents: list[Document]` | `documents: list[Document]` |
 | parsing(`kind: converter`,鏈首;契約鍵 `parsing_converter`) | `sources`、`meta`(同 import 輸出) | `documents: list[Document]` |
 | chunking | `documents: list[Document]` | `documents: list[Document]` |
+| formatter | `documents: list[Document]`、`query: str` | `payload: Any`(契約驗證對 Any 顯式跳過型別比對;socket 仍必須存在) |
 
 驗證規則(不符 → `ConfigError`,訊息指明缺什麼、實際有什麼、怎麼改):
 
@@ -161,6 +163,11 @@ custom 元件無宣告可查,建構期直接檢視
   建構期擋下(訊息會給出正確寫法)。
 - **fusion 掛上即一律執行**(單一查詢也進元件,「單查詢穿透」由元件
   自己決定);`applied` 是建議輸出,未回報時 trace 顯示三態的 None。
+- **formatter 的 `payload: Any` 是終端槽位特權**:圖上沒有下游,型別
+  開放不斷接線,唯一消費者是 `query()`(原樣放進 `output` 鍵)。中間
+  槽位的契約不可模仿此寫法 —— 邊界一開放,下游檢查即失效。元件仍須以
+  `@component.output_types` 宣告實際的具體型別;走 HTTP 時 payload 須
+  JSON 可序列化。
 - **import 的 meta 每筆必帶 `doc_id`**(socket 驗不到,執行期由
   ChunkMetaStamper 兜底報錯);custom import 回傳非本地路徑時,
   `incremental: true` 的檔案層增量退化為每次全量重 parse(出聲警告,

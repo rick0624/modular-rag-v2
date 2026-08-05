@@ -244,6 +244,12 @@ class InferenceConfig(BaseModel):
         description="槽位:Question Routing(選填;判斷查詢類別,結果附加於"
         "輸出的 routing key,不影響檢索行為)",
     )
+    formatter: MethodConfig | None = Field(
+        default=None,
+        description="槽位:Formatter(選填;fusion 之後的終端支線,把最終"
+        "結果組成對外格式,結果進 query() 輸出的 output key;"
+        "省略時 output 為 None)",
+    )
 
     @model_validator(mode="after")
     def _generation_required_unless_skipped(self) -> "InferenceConfig":

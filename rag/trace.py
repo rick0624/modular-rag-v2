@@ -147,4 +147,15 @@ def format_query_trace(trace: dict[str, Any], limit: int = 5) -> list[str]:
             "未做去重 / 聚合 / 重新排序)"
         )
     lines.extend(_format_documents(fused, limit))
+
+    # formatter:終端支線(對外格式)。用 .get:舊版 trace dict 也要能排版。
+    formatted = trace.get("formatter")
+    if formatted is not None:
+        lines.append("")
+        lines.append(f"--- Formatter(對外格式;{formatted['type']})---")
+        # payload 是任意物件:終端機印截斷的 repr,log 檔(limit=0)全印
+        rendered = repr(formatted["payload"])
+        if limit > 0 and len(rendered) > 200:
+            rendered = rendered[:200] + f"…(共 {len(rendered)} 字,log 檔全印)"
+        lines.append(f"  → {rendered}")
     return lines

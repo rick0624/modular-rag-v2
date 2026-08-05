@@ -42,6 +42,12 @@ def test_custom_ingestion_demo_end_to_end(monkeypatch):
     assert answer["documents"][0].meta["doc_id"] == "HR-0001"
     assert answer["answer"] is not None
 
+    # 內建 simple_json formatter:通用 JSON 形狀進 output 鍵
+    payload = answer["output"]
+    assert payload["query"] == "請假要提前幾天申請?"
+    assert payload["total"] == len(answer["documents"])
+    assert payload["documents"][0]["doc_id"] == "HR-0001"
+
 
 def test_custom_chunker_respects_max_chars(monkeypatch):
     monkeypatch.chdir(REPO_ROOT)

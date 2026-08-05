@@ -663,6 +663,138 @@ class TestCustomFusion:
         assert fusion.always_fuse is True  # 有 fusion 區塊 = 單查詢也融合
 
 
+FORMATTER_OK = '''
+from typing import Any
+from haystack import component
+from haystack.dataclasses import Document
+
+
+@component
+class EnvelopeFormatter:
+    """合約正確的 formatter:公司信封(payload 為 dict)。"""
+
+    @component.output_types(payload=dict[str, Any])
+    def run(self, documents: list[Document], query: str) -> dict[str, Any]:
+        return {"payload": {
+            "question": query,
+            "ids": [d.meta.get("chunk_id") for d in documents],
+        }}
+'''
+
+FORMATTER_STR_PAYLOAD = '''
+from typing import Any
+from haystack import component
+from haystack.dataclasses import Document
+
+
+@component
+class CsvFormatter:
+    """payload 型別自由:宣告 str 也要能過契約(終端槽位的 Any 特判)。"""
+
+    @component.output_types(payload=str)
+    def run(self, documents: list[Document], query: str) -> dict[str, Any]:
+        return {"payload": "\\n".join(d.meta.get("chunk_id", "") for d in documents)}
+'''
+
+FORMATTER_MISSING_QUERY = '''
+from typing import Any
+from haystack import component
+from haystack.dataclasses import Document
+
+
+@component
+class NoQueryFormatter:
+    @component.output_types(payload=dict[str, Any])
+    def run(self, documents: list[Document]) -> dict[str, Any]:
+        return {"payload": {}}
+'''
+
+FORMATTER_WRONG_OUTPUT_NAME = '''
+from typing import Any
+from haystack import component
+from haystack.dataclasses import Document
+
+
+@component
+class WrongOutputFormatter:
+    """輸入正確,但輸出 socket 名稱不是 payload。"""
+
+    @component.output_types(result=dict[str, Any])
+    def run(self, documents: list[Document], query: str) -> dict[str, Any]:
+        return {"result": {}}
+'''
+
+
+class TestCustomFormatter:
+    """formatter 槽位:documents + query → payload: Any(終端支線)。"""
+
+    @staticmethod
+    def _config(corpus_dir, formatter):
+        data = make_config(
+            ingestion={
+                "import": {
+                    "method": "local_file",
+                    "params": {"input_dir": str(corpus_dir), "extensions": [".txt"]},
+                }
+            },
+            inference={"reranking": {"method": "none"}},
+        )
+        data["inference"]["formatter"] = formatter
+        return parse_config(data)
+
+    def test_custom_formatter_end_to_end(self, tmp_path, corpus_dir):
+        file = write_module(tmp_path, FORMATTER_OK)
+        config = self._config(
+            corpus_dir,
+            {"method": "custom", "params": {"file": file, "class": "EnvelopeFormatter"}},
+        )
+        pipelines = build_pipelines(config)
+        pipelines.run_ingestion()
+
+        result = pipelines.query("向量檢索")
+        # payload 進固定的 output 鍵;canonical 鍵照舊
+        assert result["output"]["question"] == "向量檢索"
+        assert result["output"]["ids"], "信封應含檢索到的 chunk_id"
+        assert result["documents"], "canonical documents 不受 formatter 影響"
+        # trace 同步收錄
+        assert result["trace"]["formatter"]["type"] == "EnvelopeFormatter"
+        assert result["trace"]["formatter"]["payload"] == result["output"]
+
+    def test_payload_type_is_free(self, tmp_path, corpus_dir):
+        """終端槽位特權:元件宣告 payload=str 也能過契約與端到端。"""
+        file = write_module(tmp_path, FORMATTER_STR_PAYLOAD)
+        config = self._config(
+            corpus_dir,
+            {"method": "custom", "params": {"file": file, "class": "CsvFormatter"}},
+        )
+        pipelines = build_pipelines(config)
+        pipelines.run_ingestion()
+        result = pipelines.query("向量檢索")
+        assert isinstance(result["output"], str)
+        assert "chunk_0" in result["output"]
+
+    def test_missing_query_input_rejected(self, tmp_path, corpus_dir):
+        file = write_module(tmp_path, FORMATTER_MISSING_QUERY)
+        config = self._config(
+            corpus_dir,
+            {"method": "custom", "params": {"file": file, "class": "NoQueryFormatter"}},
+        )
+        with pytest.raises(ConfigError, match="缺少輸入 socket 'query"):
+            build_pipelines(config)
+
+    def test_missing_payload_output_rejected(self, tmp_path, corpus_dir):
+        file = write_module(tmp_path, FORMATTER_WRONG_OUTPUT_NAME)
+        config = self._config(
+            corpus_dir,
+            {
+                "method": "custom",
+                "params": {"file": file, "class": "WrongOutputFormatter"},
+            },
+        )
+        with pytest.raises(ConfigError, match="缺少輸出 socket 'payload"):
+            build_pipelines(config)
+
+
 class TestCustomImport:
     """import 槽位:無輸入 → sources + meta(必帶 doc_id)。"""
 
