@@ -126,6 +126,19 @@ SLOT_CONTRACTS: dict[str, SlotContract] = {
         inputs=(SocketSpec("documents", list[Document]),),
         outputs=(SocketSpec("documents", list[Document]),),
     ),
+    # formatter:選填的終端支線 —— 把融合後結果組成對外格式(公司信封)。
+    # ``payload: Any`` 是**終端槽位的特權**:圖上沒有下游要接它,型別開放
+    # 不會斷任何接線,唯一消費者是 query()(原樣放進回傳值的 output 鍵)。
+    # 中間槽位不可模仿 —— 邊界一開放,下游的契約檢查就全部失效。
+    # payload 走 HTTP(/query 回應)時須為 JSON 可序列化。
+    "formatter": SlotContract(
+        slot="formatter",
+        inputs=(
+            SocketSpec("documents", list[Document]),
+            SocketSpec("query", str),
+        ),
+        outputs=(SocketSpec("payload", Any),),
+    ),
 }
 
 
@@ -246,6 +259,11 @@ def validate_component_contract(slot: str, instance: Any, *, where: str) -> None
                 f"{spec.name}={_type_name(spec.type)},"
                 f"並在 run() 回傳的 dict 中提供該 key"
             )
+        if spec.type is Any:
+            # 終端槽位(formatter)的開放型別:socket 必須存在,但元件宣告
+            # 什麼具體型別都接受。顯式跳過而不依賴 Haystack 私有 API 對
+            # Any 的版本行為(strict-Any:sender 端 Any 對具體型別不相容)。
+            continue
         if not _types_compatible(socket.type, spec.type):
             raise ConfigError(
                 f"{where}:輸出 socket '{spec.name}' 的型別是 "

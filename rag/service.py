@@ -71,6 +71,9 @@ class QueryResponse(BaseModel):
     subquery_count: int
     prompt: str | None
     routing: dict[str, Any] | None = None  # 查詢分類;未設 routing 槽位時為 null
+    # formatter 組出的對外格式;未設 formatter 槽位時為 null。
+    # payload 走 HTTP 必須 JSON 可序列化(這是 wire 的限制,不是槽位的)。
+    output: Any | None = None
 
 
 class IngestStep(BaseModel):
@@ -259,6 +262,7 @@ def create_app(config_path: str | Path, *, stage: str = "all") -> Any:
             subquery_count=len(result["subquery_results"]),
             prompt=result["prompt"],
             routing=result.get("routing"),
+            output=result.get("output"),
         )
 
     @app.post("/ingest", response_model=IngestResponse)
@@ -318,6 +322,7 @@ def create_app(config_path: str | Path, *, stage: str = "all") -> Any:
                 generate_answer=meta["generate_answer"],
                 transform_names=meta["transform_names"],
                 routing_enabled=meta["routing_enabled"],
+                formatter_enabled=meta["formatter_enabled"],
                 stage=old.stage,  # /reload 不建 ingestion,沿用原本的建構意圖
             )
         logger.info("inference 設定重載完成")

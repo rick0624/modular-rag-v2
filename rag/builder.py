@@ -1138,6 +1138,32 @@ ROUTING_FACTORIES: dict[str, SlotFactory] = {
 }
 
 
+class _SimpleJsonParams(BaseParams):
+    include_content: bool = Field(
+        default=True, description="payload 是否包含切片內文(false = 只留引用資訊)"
+    )
+
+
+def _build_simple_json(raw: dict[str, Any], ctx: BuildContext) -> Any:
+    from rag.components.formatting import SimpleJsonFormatter
+
+    p = _validate_params("formatter", "simple_json", _SimpleJsonParams, raw)
+    return SimpleJsonFormatter(include_content=p.include_content)
+
+
+def _build_custom_formatter(raw: dict[str, Any], ctx: BuildContext) -> Any:
+    p = _validate_params("formatter", "custom", CustomModuleParams, raw)
+    return instantiate_custom("formatter", p)
+
+
+# formatter 槽位是選填(config 省略 = 不做),因此不提供 "none" 方法。
+# 契約:documents + query → payload: Any(終端支線,型別開放見 contracts.py)。
+FORMATTER_FACTORIES: dict[str, SlotFactory] = {
+    "simple_json": SlotFactory(build=_build_simple_json),
+    "custom": SlotFactory(build=_build_custom_formatter),
+}
+
+
 def _chat_generator_from_block(
     where: str, block: dict[str, Any] | None, ctx: BuildContext
 ) -> Any:
@@ -1697,6 +1723,22 @@ def build_inference_pipeline(
         )
         routing_enabled = True
 
+    # formatter:終端支線 —— 從 fusion.documents 岔出(與 prompt → generator
+    # 並聯,fan-out 合法),把最終結果組成對外格式;query 由 query() 執行期
+    # 餵入。payload 由 query() 收進回傳值的 output 鍵,圖上沒有下游。
+    formatter_enabled = False
+    if inf.formatter is not None:
+        formatter_method = _require_single("formatter", inf.formatter)
+        formatter_factory = _resolve(
+            "formatter", FORMATTER_FACTORIES, formatter_method
+        )
+        outer.add_component(
+            "formatter",
+            formatter_factory.build(inf.formatter.params_for(formatter_method), ctx),
+        )
+        outer.connect("fusion.documents", "formatter.documents")
+        formatter_enabled = True
+
     if inf.generate_answer:
         generation_method = _require_single("generation", inf.generation)
         generation_factory = _resolve(
@@ -1727,6 +1769,7 @@ def build_inference_pipeline(
         "generate_answer": inf.generate_answer,
         "transform_names": transform_names,
         "routing_enabled": routing_enabled,
+        "formatter_enabled": formatter_enabled,
         "store": store,
     }
 
@@ -1763,6 +1806,7 @@ class RagPipelines:
     generate_answer: bool = True
     transform_names: list[str] = dc_field(default_factory=list)
     routing_enabled: bool = False
+    formatter_enabled: bool = False
     stage: str = "all"
 
     def run_ingestion(self) -> dict[str, Any]:
@@ -1853,7 +1897,9 @@ class RagPipelines:
             ``subquery_results``(各子查詢重排後結果)、``prompt``
             (實際送出的 prompt,可稽核)、``reply_meta``(模型 /
             finish_reason / usage 等)、``routing``(查詢分類結果;
-            未設定 routing 槽位時為 ``None``)、``trace``(逐步紀錄,見下)。
+            未設定 routing 槽位時為 ``None``)、``output``(formatter
+            組出的對外格式 payload;未設定 formatter 槽位時為 ``None``)、
+            ``trace``(逐步紀錄,見下)。
             檢索-only 模式(``generate_answer: false``)key 不變,
             但 ``answer`` / ``prompt`` / ``reply_meta`` 為 ``None``。
 
@@ -1867,6 +1913,7 @@ class RagPipelines:
                   "fusion": {documents, applied},               # 融合 / 去重後
                                                 # applied 三態:True 融合過 /
                                                 # False 內建穿透 / None custom 未回報
+                  "formatter": {type, payload} | None,          # 對外格式(終端支線)
                   "generation": {prompt, answer, meta} | None,
                 }
 
@@ -1897,10 +1944,18 @@ class RagPipelines:
         if self.routing_enabled:
             # routing 吃原始查詢(不經 transform 鏈),與 prompt_builder 同機制
             data["routing"] = {"query": text}
+        if self.formatter_enabled:
+            # formatter 的 documents 接自 fusion;query 與 prompt_builder 同機制
+            data["formatter"] = {"query": text}
         result = self.inference.run(data, include_outputs_from=include)
         route = (
             (result.get("routing") or {}).get("route")
             if self.routing_enabled
+            else None
+        )
+        output = (
+            (result.get("formatter") or {}).get("payload")
+            if self.formatter_enabled
             else None
         )
         answer = prompt_text = reply_meta = None
@@ -1927,6 +1982,7 @@ class RagPipelines:
             "prompt": prompt_text,
             "reply_meta": reply_meta,
             "routing": route,
+            "output": output,
             "trace": {
                 "query": text,
                 "transforms": transforms,
@@ -1939,6 +1995,16 @@ class RagPipelines:
                     # (custom fusion 一律執行,applied 是建議輸出)
                     "applied": result["fusion"].get("applied"),
                 },
+                "formatter": (
+                    {
+                        "type": type(
+                            self.inference.get_component("formatter")
+                        ).__name__,
+                        "payload": output,
+                    }
+                    if self.formatter_enabled
+                    else None
+                ),
                 "generation": (
                     {"prompt": prompt_text, "answer": answer, "meta": reply_meta}
                     if self.generate_answer
@@ -1997,6 +2063,7 @@ def build_pipelines(
     generate_answer = True
     transform_names: list[str] = []
     routing_enabled = False
+    formatter_enabled = False
     if stage != "ingestion":
         if native is not None and native.inference is not None:
             inference_pipeline = _load_native_pipeline(native.inference)
@@ -2009,6 +2076,7 @@ def build_pipelines(
             generate_answer = meta["generate_answer"]
             transform_names = meta["transform_names"]
             routing_enabled = meta["routing_enabled"]
+            formatter_enabled = meta["formatter_enabled"]
     return RagPipelines(
         config=config,
         ingestion=ingestion_pipeline,
@@ -2018,5 +2086,6 @@ def build_pipelines(
         generate_answer=generate_answer,
         transform_names=transform_names,
         routing_enabled=routing_enabled,
+        formatter_enabled=formatter_enabled,
         stage=stage,
     )

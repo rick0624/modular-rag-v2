@@ -205,3 +205,32 @@ def test_custom_fusion_without_applied_renders_custom_branch(corpus_dir, tmp_pat
     assert "未回報 applied" in joined
     # 既有兩種分支的字樣不可誤現
     assert "未啟用:原樣通過" not in joined
+
+
+def test_formatter_trace_renders_and_absent_when_not_mounted(corpus_dir):
+    data = make_config(
+        ingestion={
+            "import": {
+                "method": "local_file",
+                "params": {"input_dir": str(corpus_dir), "extensions": [".txt"]},
+            },
+        },
+        inference={"reranking": {"method": "none"}},
+    )
+    data["inference"]["formatter"] = {"method": "simple_json"}
+    pipelines = build_pipelines(parse_config(data))
+    pipelines.run_ingestion()
+    result = pipelines.query("FAISS 支援哪些索引結構?")
+
+    from rag.trace import format_query_trace
+
+    joined = "\n".join(format_query_trace(result["trace"]))
+    assert "Formatter(對外格式;SimpleJsonFormatter)" in joined
+    # 終端機截斷,log 檔(limit=0)全印
+    full = "\n".join(format_query_trace(result["trace"], limit=0))
+    assert len(full) >= len(joined)
+
+    # 未掛 formatter 的舊 trace dict(無此鍵)也要能排版
+    legacy = dict(result["trace"])
+    del legacy["formatter"]
+    format_query_trace(legacy)

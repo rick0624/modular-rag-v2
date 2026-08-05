@@ -66,6 +66,12 @@ def test_custom_demo_end_to_end(corpus_dir, monkeypatch):
     parser_2 = pipelines.ingestion.get_component("parser_2")
     assert type(parser_2).__name__ == "CompanyBoilerplateCleaner"
 
+    # custom formatter:公司信封進 output 鍵,欄位來自 retriever 塞的 meta
+    envelope = result["output"]
+    assert envelope["question"] == "請假規則怎麼申請?"
+    assert envelope["totalCount"] == len(documents)
+    assert all(row["dockey"] for row in envelope["returnData"])
+
     lines = format_query_trace(result["trace"])
     joined = "\n".join(lines)
     assert "Routing" in joined

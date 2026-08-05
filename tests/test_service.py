@@ -199,3 +199,25 @@ def test_reload_with_invalid_config_returns_400(service):
     response = client.post("/reload")
     assert response.status_code == 400
     assert "does_not_exist" in response.json()["detail"]
+
+
+def test_query_response_includes_formatter_output(tmp_path, corpus_dir):
+    data = _service_config(corpus_dir)
+    data["inference"]["formatter"] = {"method": "simple_json"}
+    path = _write_config(tmp_path, data)
+    client = TestClient(create_app(path))
+
+    body = client.post("/query", json={"query": "FAISS?"}).json()
+    assert body["output"]["query"] == "FAISS?"
+    assert body["output"]["total"] == len(body["documents"])
+
+    # /reload 後 formatter 仍生效(formatter_enabled 有穿線)
+    assert client.post("/reload").status_code == 200
+    body = client.post("/query", json={"query": "BM25?"}).json()
+    assert body["output"]["query"] == "BM25?"
+
+
+def test_query_response_output_null_without_formatter(service):
+    client, _, _ = service
+    body = client.post("/query", json={"query": "FAISS?"}).json()
+    assert body["output"] is None

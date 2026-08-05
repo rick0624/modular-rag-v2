@@ -297,6 +297,20 @@ inference:
   #   # 注意:掛了 custom 就一律執行(單一查詢也進元件,原樣通過與否
   #   # 由元件決定);建議額外輸出 applied: bool 供 trace 區分
 
+  # formatter:                      # 選填:對外格式(fusion 之後的終端支線;
+  #                                 # payload 進 query() 輸出的 output key,
+  #                                 # canonical 的 documents 等鍵照舊)
+  #   method: simple_json           # 內建:通用 JSON 形狀
+  #   params:
+  #     include_content: true       # 預設 true;false = 只留引用資訊
+  #   method_params:
+  #     custom:                     # 公司信封(契約:documents + query
+  #       # 契約輸出 payload: Any   #        → payload: Any,型別自由 ——
+  #       #                         #   終端槽位特權;走 HTTP 須可序列化)
+  #       file: ./my_formatter.py   # 或 class_path: "pkg.mod:Class"
+  #       class: MyFormatter
+  #       # init_params: {}         # 預設 {}
+
   # routing:                        # 選填:查詢分類(獨立支線,不影響檢索;
   #                                 # 結果附加於輸出的 routing key 與 trace)
   #   method: keyword_match         # 可選:keyword_match / custom

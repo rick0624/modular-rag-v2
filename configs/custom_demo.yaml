@@ -99,6 +99,14 @@ inference:
       #     人資/差勤: [請假, 特休, 薪資]
       #   default_category: 其他
 
+  formatter:                        # 選填終端支線:最終結果組成對外格式,
+    method: custom                  # 進 query() 輸出的 output 鍵(省略 = None)
+    params:                         # 契約:documents + query → payload: Any
+      file: examples/custom_modules/company_formatter.py
+      class: CompanyResponseBuilder
+      # init_params:
+      #   include_content: true
+
   generation:
     method: custom                  # 契約:messages: list[ChatMessage]
     params:                         #      → replies: list[ChatMessage]

@@ -443,6 +443,82 @@ class TestStageSelection:
         assert pipelines.run_ingestion()["writer"]["documents_written"] > 0
 
 
+class TestFormatterSlot:
+    """formatter:選填終端支線(simple_json 內建方法與省略行為)。"""
+
+    @staticmethod
+    def _config(corpus_dir, formatter=None, **inference_overrides):
+        data = make_config(
+            ingestion={
+                "import": {
+                    "method": "local_file",
+                    "params": {"input_dir": str(corpus_dir), "extensions": [".txt"]},
+                }
+            },
+            inference={"reranking": {"method": "none"}, **inference_overrides},
+        )
+        if formatter is not None:
+            data["inference"]["formatter"] = formatter
+        return parse_config(data)
+
+    def test_omitted_slot_means_no_component_and_none_output(self, corpus_dir):
+        pipelines = build_pipelines(self._config(corpus_dir))
+        assert "formatter" not in pipelines.inference.to_dict()["components"]
+        pipelines.run_ingestion()
+        result = pipelines.query("向量檢索")
+        assert result["output"] is None
+        assert result["trace"]["formatter"] is None
+
+    def test_simple_json_shape(self, corpus_dir):
+        pipelines = build_pipelines(
+            self._config(corpus_dir, formatter={"method": "simple_json"})
+        )
+        pipelines.run_ingestion()
+        result = pipelines.query("向量檢索")
+
+        payload = result["output"]
+        assert payload["query"] == "向量檢索"
+        assert payload["total"] == len(payload["documents"])
+        first = payload["documents"][0]
+        assert set(first) == {"doc_id", "chunk_id", "page", "score", "content"}
+        assert first["chunk_id"] == result["documents"][0].meta["chunk_id"]
+
+    def test_simple_json_without_content(self, corpus_dir):
+        pipelines = build_pipelines(
+            self._config(
+                corpus_dir,
+                formatter={
+                    "method": "simple_json",
+                    "params": {"include_content": False},
+                },
+            )
+        )
+        pipelines.run_ingestion()
+        payload = pipelines.query("向量檢索")["output"]
+        assert all("content" not in row for row in payload["documents"])
+
+    def test_coexists_with_generation(self, corpus_dir):
+        """開生成時 answer 與 output 並存(fusion.documents fan-out 兩支線)。"""
+        data = make_config(
+            ingestion={
+                "import": {
+                    "method": "local_file",
+                    "params": {"input_dir": str(corpus_dir), "extensions": [".txt"]},
+                }
+            },
+            inference={
+                "reranking": {"method": "none"},
+                "generation": {"method": "mock", "params": {"replies": ["答案"]}},
+            },
+        )
+        data["inference"]["formatter"] = {"method": "simple_json"}
+        pipelines = build_pipelines(parse_config(data))
+        pipelines.run_ingestion()
+        result = pipelines.query("向量檢索")
+        assert result["answer"] == "答案"
+        assert result["output"]["total"] >= 1
+
+
 def test_native_pipeline_stage_requires_build_pipelines():
     data = make_config()
     del data["ingestion"]

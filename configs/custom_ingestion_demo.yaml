@@ -63,5 +63,10 @@ inference:
   reranking:
     method: none
 
+  formatter:
+    method: simple_json             # 內建:通用 JSON 形狀(query / total /
+    # params:                       #   documents 清單);公司信封用 custom
+    #   include_content: true       # 預設 true;false = 只留引用資訊
+
   generation:
     method: mock
