@@ -28,7 +28,7 @@
 | | `sentence_transformers` | 本地模型 🔌 `[st]` |
 | | `api_embedding` | 通用 HTTP embedding API(欄位名可對映,OpenAI 式也用它) |
 | 5 Indexing | `in_memory` | 記憶體索引(隨 process 消失;開發測試用) |
-| | `elasticsearch` | ES 索引(向量 + BM25 + filter;支援增量 ingest)🔌 `[es]` |
+| | `elasticsearch` | ES 索引(向量 + BM25 + filter;支援增量 ingest、自訂 mapping 與 ingest pipeline)🔌 `[es]` |
 
 ## Inference
 

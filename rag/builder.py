@@ -540,6 +540,18 @@ class _ElasticsearchParams(_IndexingCommonParams):
     verify_certs: bool | None = Field(
         default=None, description="是否驗證伺服器憑證(預設 true;關閉會失去傳輸層保護)"
     )
+    custom_mapping: dict[str, Any] | None = Field(
+        default=None,
+        description="完整覆蓋預設索引 mapping(欄位可指定 plugin analyzer;"
+        "須自行涵蓋 content 與 embedding dense_vector 欄位,dims 須等於"
+        "embedding 模型維度)。僅在索引不存在、由本框架建立時生效;"
+        "analyzer 的定義(settings.analysis)不在 mapping 範圍,"
+        "須由預建索引或 ES index template 提供",
+    )
+    ingest_pipeline: str | None = Field(
+        default=None,
+        description="寫入文件時套用的 ES ingest pipeline 名稱(伺服器端須已建立)",
+    )
 
 
 def _elasticsearch_auth_kwargs(p: Any) -> dict[str, Any]:
@@ -568,9 +580,28 @@ def _elasticsearch_auth_kwargs(p: Any) -> dict[str, Any]:
     return {}
 
 
+def _elasticsearch_store_kwargs(p: _ElasticsearchParams) -> dict[str, Any]:
+    """組出 ElasticsearchDocumentStore 的建構參數(選填欄位不設定就不帶)。"""
+    kwargs: dict[str, Any] = {
+        "hosts": p.hosts,
+        "index": p.index,
+        "embedding_similarity_function": "cosine",
+        **_elasticsearch_auth_kwargs(p),
+    }
+    if p.ca_certs is not None:
+        kwargs["ca_certs"] = p.ca_certs
+    if p.verify_certs is not None:
+        kwargs["verify_certs"] = p.verify_certs
+    if p.custom_mapping is not None:
+        kwargs["custom_mapping"] = p.custom_mapping
+    if p.ingest_pipeline is not None:
+        kwargs["ingest_pipeline"] = p.ingest_pipeline
+    return kwargs
+
+
 def _build_elasticsearch_store(raw: dict[str, Any], ctx: BuildContext) -> Any:
     p = _validate_params("indexing", "elasticsearch", _ElasticsearchParams, raw)
-    auth = _elasticsearch_auth_kwargs(p)
+    kwargs = _elasticsearch_store_kwargs(p)
     try:
         from haystack_integrations.document_stores.elasticsearch import (
             ElasticsearchDocumentStore,
@@ -579,16 +610,6 @@ def _build_elasticsearch_store(raw: dict[str, Any], ctx: BuildContext) -> Any:
         raise MissingDependencyError(
             "elasticsearch-haystack", "elasticsearch indexing 方法"
         ) from exc
-    kwargs: dict[str, Any] = {
-        "hosts": p.hosts,
-        "index": p.index,
-        "embedding_similarity_function": "cosine",
-        **auth,
-    }
-    if p.ca_certs is not None:
-        kwargs["ca_certs"] = p.ca_certs
-    if p.verify_certs is not None:
-        kwargs["verify_certs"] = p.verify_certs
     return ElasticsearchDocumentStore(**kwargs)
 
 

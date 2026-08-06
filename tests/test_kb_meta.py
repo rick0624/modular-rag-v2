@@ -136,6 +136,21 @@ def test_es_credentials_do_not_change_fingerprint():
     }
     assert ingestion_fingerprint(authed) == ingestion_fingerprint(plain)
 
+
+def test_custom_mapping_changes_fingerprint():
+    """custom_mapping 決定索引怎麼建(analyzer / 欄位),改了 = 索引過期。"""
+    base = make_config()
+    plain = copy.deepcopy(base)
+    plain["ingestion"]["indexing"] = {
+        "method": "elasticsearch",
+        "params": {"hosts": "${ES_URL}", "index": "kb"},
+    }
+    mapped = copy.deepcopy(plain)
+    mapped["ingestion"]["indexing"]["params"]["custom_mapping"] = {
+        "properties": {"content": {"type": "text", "analyzer": "ik_smart"}}
+    }
+    assert ingestion_fingerprint(mapped) != ingestion_fingerprint(plain)
+
     # 但索引位置本身變了,仍要被偵測到
     moved = copy.deepcopy(plain)
     moved["ingestion"]["indexing"]["params"]["index"] = "kb2"
