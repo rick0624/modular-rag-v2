@@ -108,7 +108,7 @@ class CompanyRetriever:
         #   contentChunk → Document.content(下游 rerank / prompt 讀這裡)
         #   score        → Document.score
         #   其餘欄位      → Document.meta(無損側帶,最終輸出還拿得到)
-        # 另補框架的 meta 契約鍵(docs/interfaces.md §1):doc_id / chunk_id
+        # 另補框架的 meta 契約鍵(docs/interfaces.md §2):doc_id / chunk_id
         # 讓 trace 標籤、fusion 的 group_by: doc、evaluation 直接可用。
         documents = [
             Document(
