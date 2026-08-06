@@ -13,18 +13,20 @@
 ingestion:
   import:
     method: local_file
-    params:
-      input_dir: ./data/raw
-      extensions: [".txt", ".md"]   # 釘住純文字:parsing 用 plain_text 才合法
+    method_params:
+      local_file:
+        input_dir: ./data/raw
+        extensions: [".txt", ".md"] # 釘住純文字:parsing 用 plain_text 才合法
 
   parsing:
     method: plain_text              # 含 PDF 的語料改:extensions 放開、這裡換 auto
 
   chunking:
     method: fixed_size
-    params:
-      split_length: 300
-      split_overlap: 50
+    method_params:
+      fixed_size:
+        split_length: 300
+        split_overlap: 50
 
   embedding:
     method: api_embedding           # 公司 embedding API(OpenAI 式回應)
@@ -42,17 +44,18 @@ ingestion:
 
   indexing:
     method: elasticsearch           # 向量 + BM25 + filter 都在 ES 伺服器端
-    params:
-      hosts: ${ES_URL}
-      index: modular-rag-company
-      # 公司叢集通常開著 security:沒帶憑證會收到
-      #   401 security_exception: missing authentication credentials
-      # 取消註解其中一組(擇一),並在 .env 補上對應變數:
-      # username: ${ES_USERNAME}
-      # password: ${ES_PASSWORD}
-      # api_key: ${ES_API_KEY}
-      # https 且憑證由私有 CA 簽發時,另外指定 CA:
-      # ca_certs: ${ES_CA_CERTS}
+    method_params:
+      elasticsearch:
+        hosts: ${ES_URL}
+        index: modular-rag-company
+        # 公司叢集通常開著 security:沒帶憑證會收到
+        #   401 security_exception: missing authentication credentials
+        # 取消註解其中一組(擇一),並在 .env 補上對應變數:
+        # username: ${ES_USERNAME}
+        # password: ${ES_PASSWORD}
+        # api_key: ${ES_API_KEY}
+        # https 且憑證由私有 CA 簽發時,另外指定 CA:
+        # ca_certs: ${ES_CA_CERTS}
 
 inference:
   query_transformation:
@@ -66,8 +69,9 @@ inference:
 
   retrieval:
     method: hybrid                  # ES BM25 + kNN,RRF 融合
-    params:
-      top_k: 10
+    method_params:
+      hybrid:
+        top_k: 10
 
   reranking:
     method: [similarity, llm]       # 雙段:cross-encoder 收斂 → LLM 精排

@@ -1,7 +1,8 @@
-# 自己的文件(txt / md / pdf 混放皆可):condense.yaml 的混合 KB 版本(檢索-only)。
+# 自己的文件(txt / md / pdf 混放皆可):condense.yaml 的混合 KB 版本。
 #
-# 只有兩處與 condense.yaml 不同 —— import 不限型別、parsing 用 auto 分流;
-# 其餘(embedding / ES / 改寫 / 重排 / 事實查核 / fusion)完全相同。
+# 與 condense.yaml 的差異 —— import 不限型別、parsing 用 auto 分流、
+# generate_answer: true(有做答案生成);其餘(embedding / ES / 改寫 /
+# 重排 / 事實查核 / fusion)完全相同。
 #
 #   1. 把文件(txt / md / pdf)放進 ./data/docs/(子資料夾也會被掃到)
 #   2. python scripts/run_demo.py --config configs/docs.yaml --query "你的問題"
@@ -15,29 +16,32 @@
 ingestion:
   import:
     method: local_file              # 預設收 .txt/.md/.pdf;recursive: true 含子資料夾
-    params:
-      input_dir: ./data/docs
+    method_params:
+      local_file:
+        input_dir: ./data/docs
 
   parsing:
     method: auto                    # 依檔案類型分流(pdf 會產生頁碼 meta)
-    params:
-      # force:PDF 全頁 OCR(需 pip install -e ".[ocr]")。榜單這類多欄
-      # 表格版面,pypdf 文字層順序是亂的(標題與其下方編號相隔數百字元),
-      # OCR 按視覺位置輸出才能保持相鄰。掃描檔(無文字層)也靠它。
-      # 成本約每頁數秒 —— 搭配 indexing.incremental: true,檔案沒變的
-      # 後續 ingest 連 parse 都跳過,只有第一次(或檔案變更時)要付。
-      # 引號不可省:YAML 把裸寫的 off/on/yes/no 解析成布林值
-      ocr: "off"
+    method_params:
+      auto:
+        # force:PDF 全頁 OCR(需 pip install -e ".[ocr]")。榜單這類多欄
+        # 表格版面,pypdf 文字層順序是亂的(標題與其下方編號相隔數百字元),
+        # OCR 按視覺位置輸出才能保持相鄰。掃描檔(無文字層)也靠它。
+        # 成本約每頁數秒 —— 搭配 indexing.incremental: true,檔案沒變的
+        # 後續 ingest 連 parse 都跳過,只有第一次(或檔案變更時)要付。
+        # 引號不可省:YAML 把裸寫的 off/on/yes/no 解析成布林值
+        ocr: "off"
     # method: [auto, clean]         # 版面雜訊多時改用鏈:分流後再清空白
 
   chunking:
     method: fixed_size              # 也可改 page_based(一頁一切片)或 structure_based
-    params:
-      split_length: 300
-      split_overlap: 50
+    method_params:
+      fixed_size:
+        split_length: 300
+        split_overlap: 50
 
   embedding:
-    method: api_embedding
+    method: api_embedding           # OpenAI embeddings API(OpenAI 式回應)
     method_params:
       api_embedding:
         endpoint: https://api.openai.com/v1/embeddings
@@ -45,18 +49,19 @@ ingestion:
           Authorization: Bearer ${OPENAI_API_KEY}
         model: text-embedding-3-small
         batch_size: 16
-        embeddings_field: data
+        embeddings_field: data      # {"data": [{"embedding": [...]}]} 形狀
         item_field: embedding
 
   indexing:
     method: elasticsearch
-    params:
-      hosts: http://localhost:9200
-      # 獨立索引:跟範例語料分開,查詢結果才不會混進 faiss.txt 那些切片
-      index: modular-rag-docs
-      # 增量 ingest:內容未變的切片跳過 embedding 與寫入(新增檔案時
-      # POST /ingest 只花新檔案的 embedding 成本)
-      incremental: true
+    method_params:
+      elasticsearch:
+        hosts: http://localhost:9200
+        # 獨立索引:跟範例語料分開,查詢結果才不會混進 faiss.txt 那些切片
+        index: modular-rag-docs
+        # 增量 ingest:內容未變的切片跳過 embedding 與寫入(新增檔案時
+        # POST /ingest 只花新檔案的 embedding 成本)
+        incremental: true
 
 inference:
   query_transformation:
@@ -81,9 +86,10 @@ inference:
 
   retrieval:
     method: hybrid
-    params:
-      top_k: 10
-      boost_k_factor: 3
+    method_params:
+      hybrid:
+        top_k: 10
+        boost_k_factor: 3
 
   reranking:
     method: [similarity, llm_fact_check]
@@ -122,7 +128,7 @@ inference:
         api_key: YOUR_TOKEN
       mock: {}
 
-  generate_answer: true            # 要看生成的答案就改成 true
+  generate_answer: true             # 檢索-only(不做答案生成)改 false
 
   fusion:
     group_by: none                  # 想看「命中哪幾份文件」可改 doc

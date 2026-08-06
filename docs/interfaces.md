@@ -1,221 +1,81 @@
-# 介面契約(Haystack 語境)
+# 介面契約
 
-v2 不再自訂資料物件:模組之間傳遞的是 Haystack 的 `Document` 與
-`ChatMessage`。框架的契約因此縮減成兩件事:**Document 的 meta 鍵**
-(哪些欄位一定存在、語意是什麼)+ **槽位的輸入輸出形狀**。
-只要這兩者不變,方法怎麼換、元件內部怎麼改,都不影響其他部分。
+模組之間傳遞的是 Haystack 的 `Document` 與 `ChatMessage`,不自訂資料物件。
+契約 = **每個模組的輸入輸出形狀** + **Document 的 meta 鍵**;兩者不變,
+方法怎麼換都不影響其他模組。可用的方法選項見 [methods.md](methods.md)。
 
-## 1. Document meta 鍵契約
+## 1. 模組 Input / Output 一覽
 
-切片(經過 `ChunkMetaStamper` 之後的 Document)保證帶有:
-
-| meta 鍵 | 型別 | 語意 |
+| 模組 | Input | Output |
 |---|---|---|
-| `doc_id` | str | 來源文件識別碼 = 檔案相對 `input_dir` 的 POSIX 路徑;**跨執行穩定**(同一來源永遠同 id),upsert / 評估都靠它 |
-| `seq` | int | 文件內切片序號(0 起,全文件連續,不分頁重排) |
-| `page` | int \| None | 來源頁碼(1 起)。分頁來源(PDF)為實際頁碼;**非分頁來源為 1**(v1 為 None;按文件分組的語意等價) |
-| `chunk_id` | str | `"{doc_id}::chunk_{seq}"`;**同時也是 `Document.id`** |
-| `source` / `importer` | str | 來源路徑與匯入方法(由 FileLister 提供,經 converter 流動) |
+| 1 Import | (無;來源寫在 params) | `sources: list[str \| Path \| ByteStream]` + `meta: list[dict]`(每筆必帶 `doc_id`) |
+| 2 Parsing | `sources` + `meta` | `list[Document]`(內容變純文字;鏈首 converter 之後的鏈中方法為 Document → Document) |
+| 3 Chunking | `list[Document]` | `list[Document]`(切片;meta 逐塊複製) |
+| 4 Embedding | 建索引端:`list[Document]`;查詢端:`str` | 建索引端:`list[Document]`(帶 `embedding` 向量);查詢端:向量(兩端同一方法派生,保證同向量空間) |
+| 5 Indexing | 寫入:`list[Document]`(含向量) | document store(檢索由 Retrieval 模組查它;向量或文字,可帶 filters) |
+| 6 Query Transformation | `queries: list[str]` | `queries: list[str]`(1 筆 = 不拆解,即傳統流程;可方法鏈) |
+| 7 Retrieval | `query: str` | `documents: list[Document]` |
+| 8 Reranking | `query: str` + `documents: list[Document]` | `documents: list[Document]`(只能重排/過濾/改分,不得改內容;可方法鏈) |
+| 融合/聚合(pipeline 內建步驟,非獨立模組) | `results: list[list[Document]]` | `documents: list[Document]` |
+| 9 Generation | `messages: list[ChatMessage]`(prompt 由框架的 ChatPromptBuilder 組好) | `replies: list[ChatMessage]`(至少一則,取 `replies[0]`) |
+| 10 Evaluation | `list[EvalCase]` + 各題 `query()` 完整輸出 | metrics dict(`hit_rate` / `mrr` + 逐題明細) |
+| Routing(選填支線) | `query: str`(原始查詢,不經 transform) | `route: dict`(不影響檢索,附加於 `query()` 輸出) |
+| Formatter(選填終端支線) | `documents` + `query: str` | `payload: Any`(進 `query()` 輸出的 `output` 鍵) |
 
-融合 / 聚合後(`SubqueryFusion` 輸出)額外帶有:
+custom module(`method: custom`)掛進槽位時,元件的 socket 必須符合上表
+同一行的形狀 —— 建構期以 introspection 驗證,不符直接報錯並指明缺什麼。
+
+## 2. Document meta 鍵
+
+切片(經 `ChunkMetaStamper` 後)保證帶有:
 
 | meta 鍵 | 語意 |
 |---|---|
-| `group_key` | 聚合鍵:`chunk_id` / `doc_id` / `"{doc_id}#p{page}"` |
-| `num_merged` | 此組合併的來源筆數 |
-| `sources` | 各來源的 `{subquery_index, rank, score}`(重排後名次與原始分數) |
+| `doc_id` | 來源文件識別碼(檔案相對 `input_dir` 的路徑);跨執行穩定,upsert / 評估靠它 |
+| `seq` | 文件內切片序號(0 起) |
+| `page` | 來源頁碼(1 起;非分頁來源為 1) |
+| `chunk_id` | `"{doc_id}::chunk_{seq}"`;**同時是 `Document.id`**(→ 寫入即 upsert;代價:切片內容此後不得改動) |
 
-**`Document.id = chunk_id` 是刻意的設計**(偏離 Haystack 的內容雜湊
-預設):id 穩定 → `DocumentWriter(policy=OVERWRITE)` 即 upsert 語意、
-ES 的 `_id` 可預測。代價:切片內容在 stamper 之後**不得再改動**
-(id 不會跟著變)。
+融合後另帶 `group_key`(聚合鍵)、`num_merged`(合併筆數)、`sources`
+(各來源的子查詢/名次/分數)。
 
-## 2. 不變量(修改程式時不可破壞)
+## 3. 不變量(修改程式時不可破壞)
 
-- **分數**:一律越大越相關;結果依分數降冪;只在同一次結果內可比
-  (cosine、BM25、RRF 量綱不同,不可跨方法比較)。
-- **識別碼**:`doc_id` / `chunk_id` 確定性 —— 同輸入必同 id。
-- **空白切片不產生輸出**(頁碼由 splitter 先數好,不受過濾影響)。
-- **同向量空間**:查詢端 embedder 一律由 `ingestion.embedding` 派生
-  (沒有 inference 端 embedding 槽位),結構上保證與索引同源。
+- **分數**:越大越相關、結果降冪;只在同一次結果內可比(不可跨方法比較)。
+- **識別碼確定性**:同輸入必同 `doc_id` / `chunk_id`。
+- **同向量空間**:查詢端 embedder 由 `ingestion.embedding` 派生,
   換 embedding 方法或模型後必須重建索引。
-- **prompt 可稽核**:`RagPipelines.query()` 回傳的 `prompt` 就是實際
-  送給 LLM 的內容;切片一律帶 `[chunk_id]` 前綴,引用可回溯。
+- **prompt 可稽核**:`query()` 回傳的 `prompt` 即實際送 LLM 的內容,
+  切片帶 `[chunk_id]` 前綴,引用可回溯。
+- **邊界映射責任**:外部系統的欄位在 custom 元件內部轉成 canonical 型別
+  (內文 → `Document.content`、分數 → `score`、其餘進 `meta`);
+  模組之間永遠只流 canonical 型別。
 
-## 3. 槽位輸入輸出(Haystack 語境)
+## 4. 建構期檢查
 
-```
-Ingestion:  import(FileLister) [→ SourceChangeFilter(檔案層增量)]
-            → sources+meta → parsing(converter[→processor…];pdf 走
-            PdfToDocument = pypdf 文字層 + 選擇性 OCR)
-            → documents → chunking(splitter) → ChunkMetaStamper
-            [→ IncrementalChangeFilter(切片層增量)]
-            → embedding(document embedder) → DocumentWriter(store)
+不合法組合在建 pipeline 時直接報錯(不會跑到一半才炸):
 
-Inference:  query:str → query_transformation 鏈(list[str] → list[str])
-            → MultiQueryRetrievalStage(內部:retrieval [→ reranking 鏈])
-            → list[list[Document]] → SubqueryFusion → list[Document]
-            → ChatPromptBuilder → chat generator → replies
-            (generate_answer: false 時圖止於 SubqueryFusion,檢索-only)
-            └→ routing(選填獨立支線):query:str → route: dict
-               吃「原始」查詢(不經 transform 鏈)、圖上無下游;
-               結果附加於 query() 回傳的 routing key 與 trace,不影響檢索
+1. **content_type**:import 宣告輸出型別(text / pdf / mixed),
+   parsing 鏈首宣告可接受的型別。
+2. **pages**:`page_based` chunking 需要會產生頁界的 parser(pdf / auto)。
+3. **索引能力**:retrieval 所需能力(向量/文字/filter/增量)必須是
+   indexing 方法宣告能力的子集。
+4. **custom socket**:custom 元件的輸入輸出 socket 必須符合 §1 契約;
+   額外輸出允許(自動進 trace),契約外的必填輸入不允許。
 
-Evaluation: JSONL 測試集 → 逐題 RagPipelines.query() → hit_rate / MRR
-```
+## 5. 服務模式要點
 
-| 槽位 | 輸入 → 輸出 | 方法鏈 |
-|---|---|---|
-| import | (params)→ `sources: list[str \| Path \| ByteStream]` + `meta: list[dict]` | ✗ |
-| parsing | sources → `documents`(鏈首 converter,其餘 Document→Document)。鏈首可展開為**內部圖**(`auto`:FileTypeRouter → 多 converter → DocumentJoiner),對外契約不變 | ✓ |
-| chunking | documents → documents(splitter;`no_chunking` = 無節點) | ✗ |
-| embedding | factory 一次建 (document_embedder, text_embedder) 一對 | ✗ |
-| indexing | factory 回傳 document store(+ 能力宣告) | ✗ |
-| query_transformation | `queries: list[str]` → `list[str]`(glossary 另輸出 `notes`;jargon_mapping **替換**查詢文字,glossary 只附註) | ✓ |
-| retrieval | 展開為內部圖(retriever[s] + joiner),輸出 documents;`boost_k_factor` 放大候選為 top_k × factor | ✗ |
-| reranking | documents(+query)→ documents;**只能重排/過濾/改分,不得改內容**(llm_fact_check 純過濾:順序與分數皆保留) | ✓ |
-| generation | ChatPromptBuilder 的 messages → `replies: [ChatMessage]`;`generate_answer: false` 時整段省略(此時 generation 區塊選填,僅作 LLM 沿用來源) | ✗ |
-| routing(選填槽位) | `query: str` → `route: dict[str, Any]`(圖上無下游;route 內容自由,慣例含 `category`) | ✗ |
-| fusion(內建步驟,可換 custom) | `list[list[Document]]` → `list[Document]`(非槽位;`inference.fusion` 設定,`method: custom` 可換自訂元件 —— 掛上即一律執行) | — |
-| formatter(選填槽位) | `documents` + `query: str` → `payload: Any`(fusion 之後的終端支線,與 prompt → generation 並聯;payload 進 `query()` 的 `output` key,圖上無下游) | ✗ |
+- **索引內容必須與 ingestion 設定一致**:ingestion 區塊(含 custom .py
+  檔內容)取雜湊為指紋,存於索引旁;`/reload` 指紋不符 → 409,
+  ingestion 設定變更一律走 `/ingest`(全量重建)。
+- `/reload` 只重建 inference(索引沿用);inference 端 custom 檔案改動
+  重載即生效。
 
-## 4. 相容性宣告(建構期檢查)
+## 6. 新需求怎麼接
 
-方法在 factory 表上宣告、`rag/compatibility.py` 在建構期檢查,
-不合法組合直接報錯並列出可相容替代:
-
-1. **content_type**:import 宣告 `output_content_type`(靜態)或
-   `output_content_type_fn`(動態:`local_file` 依 `extensions` 推導
-   —— 同質 → `text` / `pdf`,異質 → `mixed`);parsing 鏈首宣告
-   `input_content_types`(`auto` 接受全部三種)。
-2. **pages**:chunking 宣告 `requires_pages`,parsing 鏈任一環節
-   `produces_pages` 即滿足。
-3. **索引能力**:indexing 宣告 `capabilities`(`vector_search` /
-   `text_search` / `metadata_filter` / `incremental_update`),
-   retrieval 宣告 `required_capabilities`,需為子集。
-   `indexing.params.incremental: true`(增量 ingest,兩層:importer 後的
-   `SourceChangeFilter` 按檔案雜湊跳過未變檔案的 parse;stamper 後的
-   `IncrementalChangeFilter` 按 chunk_id 比對內容跳過 embedding)需要
-   `incremental_update` 能力。檔案 manifest 帶 parse 設定雜湊,設定
-   變更即作廢(全量重 parse)。
-
-宣告有靜態與動態兩型:內建方法用靜態欄位;custom 方法的宣告寫在
-config 參數裡(import 的 `content_type`、parsing 的 `kind` /
-`produces_pages` / `input_content_types`、chunking 的 `requires_pages`),
-builder 以 `_resolved_factory`(對應的 `*_fn` 欄位)在建構期解析成
-靜態欄位的複本 —— `compatibility.py` 的檢查因此完全不需要認識 custom。
-
-新增相容性維度:在 `SlotFactory` 加宣告欄位、`compatibility.py`
-補一條檢查即可。
-
-## 4b. custom module 契約(`rag/contracts.py` + `rag/custom.py`)
-
-`method: custom` 把使用者自寫的 Haystack `@component` 掛進槽位
-(config 以 `class_path: "pkg.mod:Class"` 或 `file` + `class` 指定,
-`init_params` 透傳建構子)。與 §4 的分工:§4 檢查「方法組合的語意」
-(宣告式欄位),本節檢查「元件本身的 socket 形狀」(introspection)——
-custom 元件無宣告可查,建構期直接檢視
-`__haystack_input__` / `__haystack_output__`。
-
-支援的槽位與契約(`SLOT_CONTRACTS`):
-
-| 槽位 | 必要輸入 sockets | 必要輸出 sockets |
-|---|---|---|
-| query_transformation | `queries: list[str]` | `queries: list[str]` |
-| retrieval | `query: str` | `documents: list[Document]` |
-| reranking | `query: str`、`documents: list[Document]` | `documents: list[Document]` |
-| routing | `query: str` | `route: dict[str, Any]` |
-| generation | `messages: list[ChatMessage]` | `replies: list[ChatMessage]` |
-| fusion | `results: list[list[Document]]` | `documents: list[Document]`(建議另輸出 `applied: bool`) |
-| import | (無;任何必填輸入都會被拒絕) | `sources: list[str \| Path \| ByteStream]`、`meta: list[dict[str, Any]]` |
-| parsing(`kind: doc_processor`,預設;契約鍵 `parsing`) | `documents: list[Document]` | `documents: list[Document]` |
-| parsing(`kind: converter`,鏈首;契約鍵 `parsing_converter`) | `sources`、`meta`(同 import 輸出) | `documents: list[Document]` |
-| chunking | `documents: list[Document]` | `documents: list[Document]` |
-| formatter | `documents: list[Document]`、`query: str` | `payload: Any`(契約驗證對 Any 顯式跳過型別比對;socket 仍必須存在) |
-
-驗證規則(不符 → `ConfigError`,訊息指明缺什麼、實際有什麼、怎麼改):
-
-- 契約 sockets 必須存在,型別採**寬鬆相容**(與 `Pipeline.connect`
-  同判準,私有 API 失效時退回型別名稱比對)。
-- **額外輸出 sockets 允許**(`query()` 以 `include_outputs_from` 收集
-  全節點輸出,額外輸出自動進 trace)。
-- **契約外的必填輸入不允許**(圖上沒有上游會餵它,執行期必缺輸入);
-  有預設值的額外輸入允許。
-- **邊界映射責任**:外部系統的欄位在 custom 元件**內部**轉成 canonical
-  型別(內文 → `Document.content`、分數 → `score`、其餘無損進 `meta`),
-  並建議補 §1 的 `doc_id` / `chunk_id` 契約鍵。槽位之間永遠只流
-  canonical 型別 —— 讓公司格式流出邊界,就是模組間的兩兩耦合。
-- **generation 的契約是 Haystack ChatGenerator 形狀**:prompt 仍由框架的
-  `ChatPromptBuilder` 組(`prompt_template` / `system_prompt` 照常寫在
-  YAML),custom 元件收到的是組好的 messages。因此同一支元件也能掛在
-  `llm_rewrite` / `llm_decompose` / reranking 的 `llm` 與 `llm_fact_check`
-  的 `params.generator` 底下 —— 那些方法本來就吃「generation 槽位的任一
-  方法」。回傳的 `replies` 至少要有一則(框架取 `replies[0]`),
-  `meta` 原樣進 `query()` 的 `reply_meta`。
-- **log 的歸屬**:`file:` 載入的模組名是 `_rag_custom.<檔名>_<路徑雜湊>`
-  (`rag.custom.CUSTOM_MODULE_PACKAGE`),`setup_logging` 把這棵樹與 `rag`
-  同等設成 DEBUG,所以 `getLogger(__name__)` 的紀錄進得了 log 檔;
-  `class_path:` 載入的模組名不在框架掌握範圍,慣例是自己命名在
-  `rag.custom.*` 底下(見 README「自訂方法」)。
-- **sources 的型別註記**:單一型別(`list[str]` / `list[ByteStream]`)
-  或**完整** union(`list[str | Path | ByteStream]`)都相容;部分 union
-  (如 `list[str | ByteStream]`)在 Haystack 的型別比對下不相容,會被
-  建構期擋下(訊息會給出正確寫法)。
-- **fusion 掛上即一律執行**(單一查詢也進元件,「單查詢穿透」由元件
-  自己決定);`applied` 是建議輸出,未回報時 trace 顯示三態的 None。
-- **formatter 的 `payload: Any` 是終端槽位特權**:圖上沒有下游,型別
-  開放不斷接線,唯一消費者是 `query()`(原樣放進 `output` 鍵)。中間
-  槽位的契約不可模仿此寫法 —— 邊界一開放,下游檢查即失效。元件仍須以
-  `@component.output_types` 宣告實際的具體型別;走 HTTP 時 payload 須
-  JSON 可序列化。
-- **import 的 meta 每筆必帶 `doc_id`**(socket 驗不到,執行期由
-  ChunkMetaStamper 兜底報錯);custom import 回傳非本地路徑時,
-  `incremental: true` 的檔案層增量退化為每次全量重 parse(出聲警告,
-  切片層增量不受影響)。
-- 其他槽位(embedding / indexing …)的 factory 回傳形狀不是單一元件
-  (embedding 是 document / text 一對,indexing 是 document store),
-  暫不支援 custom;需求出現時再為其設計契約。
-
-範例骨架:`examples/custom_modules/` + `configs/custom_demo.yaml`
-(inference 端 + fusion)與 `configs/custom_ingestion_demo.yaml`
-(ingestion 三槽位),各有整合測試(`tests/test_custom_demo.py` /
-`tests/test_custom_ingestion_demo.py`)保證永遠可跑。
-
-## 5. 服務模式不變量(`rag/service.py` + `rag/kb_meta.py`)
-
-- **索引內容必須與 ingestion 設定一致**。強制機制:ingestion 指紋 =
-  對「展開前」的原始 config dict 取 `{ingestion, haystack_pipelines.ingestion}`
-  區塊,`json.dumps(sort_keys=True)` 後 sha256。展開前計算 →
-  `${ENV_VAR}` 機密不進雜湊;解析後的 dict → 註解 / 排版 / anchor
-  重構不影響。**ingestion 端 custom module 的 `file:` 檔案內容一併進
-  指紋與檔案層 manifest 的作廢鍵**(改了解析 / 切塊邏輯 = 索引過期,
-  /reload 409、增量全量重 parse)。已知盲區:env var **值**的輪替、
-  escape-hatch pipeline 檔的內容變更、`class_path:` 指向的套件內容
-  (只有路徑字串進指紋)、inference 端 custom 的檔案內容(刻意排除:
-  以 `/reload` 重載即可生效 —— 每次建構都重新 exec 檔案)。
-- 指紋**排除操作性欄位**:`indexing` 的 `incremental` 與連線憑證 / TLS
-  (`api_key` / `username` / `password` / `ca_certs` / `verify_certs`)——
-  它們決定「怎麼跑」與「連不連得上」,不決定索引裡有什麼;索引位置仍由
-  `hosts` 與 `index` 決定(改了就會偵測到)。
-- 儲存位置:`elasticsearch` → index mapping `_meta`(跟索引走);
-  其他 → store 物件屬性(單 process 內有效)。
-- `/reload` 只重建 inference(store 沿用);指紋不符 → **409**,
-  導向 `/ingest`。**`/ingest` 是 ingestion 設定變更的唯一通道**
-  (全新 store、兩條 pipeline 全重建、成功後才更新指紋)。
-- 單 process、單 worker;pipeline 執行與狀態切換以同一把 lock 序列化。
-
-## 6. 新需求進來時怎麼判斷
-
-1. **是「同一槽位的另一種做法」嗎?**(換 LLM、新切法、新指標)
-   → 通用的做法:寫元件 + factory + 對映表加一行(進框架型錄);
-   專案 / 公司特定的邏輯:寫成 custom module(`method: custom`,
-   零框架改動,見 §4b)。九成需求在這裡,見 README「新增自訂方法」。
-2. **是「資料要多帶一點資訊」嗎?**(新的追溯欄位)
-   → 加 meta 鍵:只加不改,舊元件不讀新鍵也不會壞。
-3. **是「新的檔案型別」嗎?**(docx、html…)
-   → `builder.py` 的 `_EXTENSION_CONTENT_TYPES` 加副檔名對映 +
-   `auto` 的 ParsingGraph 加一條 router 分支(mime type + converter)。
-4. **真的是「流程本身多一個步驟」嗎?**
-   → 先想能不能作為既有槽位的方法或 fusion 類內建步驟;真的要改圖,
-   改 `builder.py` 的組裝邏輯(這正是薄 builder 存在的意義);
-   極端形狀走 `haystack_pipelines` escape hatch。
+1. 同一模組的另一種做法 → 通用的進框架型錄(元件 + factory 一行);
+   公司特定的寫 custom module(零框架改動)。九成需求在這裡。
+2. 資料要多帶資訊 → 加 meta 鍵(只加不改)。
+3. 新檔案型別 → 副檔名對映 + `auto` 加一條分流。
+4. 流程真的要多一步 → 改 `builder.py` 組裝邏輯;極端形狀走
+   `haystack_pipelines` escape hatch(原生 pipeline YAML)。

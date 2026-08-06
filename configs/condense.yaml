@@ -25,18 +25,20 @@
 ingestion:
   import:
     method: local_file
-    params:
-      input_dir: ./data/raw
-      extensions: [".txt", ".md"]   # 釘住純文字:parsing 用 plain_text 才合法
+    method_params:
+      local_file:
+        input_dir: ./data/raw
+        extensions: [".txt", ".md"] # 釘住純文字:parsing 用 plain_text 才合法
 
   parsing:
     method: plain_text              # 含 PDF 的語料改:extensions 放開、這裡換 auto
 
   chunking:
     method: fixed_size
-    params:
-      split_length: 300
-      split_overlap: 50
+    method_params:
+      fixed_size:
+        split_length: 300
+        split_overlap: 50
 
   embedding:
     method: api_embedding           # OpenAI embeddings API(OpenAI 式回應)
@@ -52,11 +54,12 @@ ingestion:
 
   indexing:
     method: elasticsearch           # 向量 + BM25 + filter 都在 ES 伺服器端
-    params:
-      hosts: http://localhost:9200
-      # 與 configs/home.yaml 同一個索引:embedding 模型相同(dims 一致)、
-      # 切塊設定也相同,可直接沿用已 ingest 的資料,不必重跑 ingestion。
-      index: modular-rag-openai-small
+    method_params:
+      elasticsearch:
+        hosts: http://localhost:9200
+        # 與 configs/home.yaml 同一個索引:embedding 模型相同(dims 一致)、
+        # 切塊設定也相同,可直接沿用已 ingest 的資料,不必重跑 ingestion。
+        index: modular-rag-openai-small
 
 inference:
   query_transformation:
@@ -70,9 +73,10 @@ inference:
 
   retrieval:
     method: hybrid                  # ES BM25 + kNN,RRF 融合
-    params:
-      top_k: 10
-      boost_k_factor: 3             # 候選放大:各 retriever 與 joiner 取 30 筆
+    method_params:
+      hybrid:
+        top_k: 10
+        boost_k_factor: 3           # 候選放大:各 retriever 與 joiner 取 30 筆
 
   reranking:
     method: [similarity, llm_fact_check]

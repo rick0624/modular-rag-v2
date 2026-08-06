@@ -1,70 +1,51 @@
-# 預設配置,同時是「方法型錄」:每個槽位可用的方法與參數都以
-# method_params 區塊並存展示 —— 換方法只需改 method 那一行,其餘區塊
-# 原樣保留、互不干擾(只有被選中的區塊會做參數驗證)。
+# 本機開發環境配置:OpenAI embeddings + 本機 Elasticsearch + OpenAI 生成。
+# 方法與參數的完整型錄請見 configs/default.yaml(本檔只列啟用的組合)。
 #
-# 目前啟用的組合完全離線:mock embedding + in_memory 索引 + mock 生成,
-# 不需網路、金鑰或模型下載,適合開發與試跑:
+#   cp .env.example .env          # 填入 OPENAI_API_KEY
+#   docker compose up -d          # 本機 ES(或指向既有叢集)
+#   python scripts/run_demo.py --config configs/home.yaml
 #
-#   python scripts/run_demo.py
+# 需要的環境變數:OPENAI_API_KEY
 #
-# 注意:未啟用的示範區塊使用「字面值占位符」(如 YOUR_TOKEN),不用
-# ${ENV_VAR} —— 因為 ${} 會在載入時立刻展開,引用未設定的變數即使在
-# 未使用的區塊也會報錯。實際接入時改成 ${YOUR_ENV_VAR} 並於 .env 提供。
+# configs/condense.yaml 與本檔共用同一個索引(embedding 模型與切塊設定
+# 相同),ingest 過一次即可互相沿用。
 
 ingestion:
   import:
-    method: local_file              # 萬用:txt / md / pdf 都收(extensions 可收窄)
+    method: local_file
     method_params:
       local_file:
         input_dir: ./data/raw
-        # 未指定 extensions = 預設收 [".txt", ".md", ".pdf"](content_type
-        # 推導為 mixed,parsing 需用 auto);要用 plain_text 就得釘住純文字:
-        extensions: [".txt", ".md"]
+        extensions: [".txt", ".md"] # 釘住純文字:parsing 用 plain_text 才合法
 
   parsing:
-    method: plain_text              # 可選:plain_text / pdf / auto;鏈:[auto, clean]
-    method_params:
-      plain_text:                   # 純文字(import extensions 需為 .txt/.md)
-        encoding: utf-8
-      pdf: {}                       # 純 PDF(import extensions 需為 .pdf)
-      auto:                         # 混合:依檔案類型分流(txt/md/pdf 同一 KB)
-        encoding: utf-8
-      clean:                        # 只能接在 converter 之後(方法鏈)
-        remove_empty_lines: true
-        remove_extra_whitespaces: true
+    method: plain_text              # 含 PDF 的語料改:extensions 放開、這裡換 auto
 
   chunking:
-    method: fixed_size              # 可選:fixed_size / structure_based / page_based / no_chunking
+    method: fixed_size
     method_params:
-      fixed_size:                   # 固定長度(字元),\f/段落/行邊界優先
+      fixed_size:
         split_length: 300
         split_overlap: 50
-      structure_based:              # 依結構遞迴切分(頁 → 段 → 行 → 句)
-        split_length: 512
-      page_based:                   # 按頁切(需要會產生分頁的 parser,如 pdf)
-        pages_per_chunk: 1
-      no_chunking: {}
 
   embedding:
-    method: api_embedding                    # 可選:mock / sentence_transformers / api_embedding
+    method: api_embedding           # OpenAI embeddings API(OpenAI 式回應)
     method_params:
-      mock:                         # 離線確定性偽向量(開發測試用)
-        dim: 64
-      sentence_transformers:        # 需安裝:pip install -e ".[st]"
-        model_name: sentence-transformers/all-MiniLM-L6-v2
-      api_embedding:                # 通用 HTTP API(回應形狀見 README 對映表)
+      api_embedding:
         endpoint: https://api.openai.com/v1/embeddings
         headers:
           Authorization: Bearer ${OPENAI_API_KEY}
         model: text-embedding-3-small
-        embeddings_field: data      # OpenAI 式回應:data[].embedding
+        batch_size: 16
+        embeddings_field: data      # {"data": [{"embedding": [...]}]} 形狀
         item_field: embedding
+      mock:                         # 離線試跑備援(切 method 即換)
+        dim: 64
 
   indexing:
-    method: elasticsearch               # 可選:in_memory / elasticsearch
+    method: elasticsearch           # 向量 + BM25 + filter 都在 ES 伺服器端
     method_params:
-      in_memory: {}
-      elasticsearch:                # 需安裝:pip install -e ".[es]"
+      elasticsearch:
         hosts: http://localhost:9200
         # 索引名帶上 embedding 模型:ES 的 dense_vector dims 建立後不可
         # 變更,換模型/維度就得換索引(或先刪掉重建)。
@@ -72,59 +53,28 @@ ingestion:
 
 inference:
   query_transformation:
-    method: normalize               # 可選:passthrough / normalize / glossary / llm_decompose
-    method_params:                  # 鏈:[normalize, llm_decompose]
+    method: normalize
+    method_params:
       normalize:
         lowercase: true
-      glossary:                     # 術語表:命中的定義注入 prompt
-        glossary:
-          RRF: Reciprocal Rank Fusion,以名次融合多路檢索結果
-        # glossary_path: ./configs/glossary.yaml
-        # expand_query: false
-      llm_decompose:                # LLM 查詢拆解(1 → N 子查詢)
-        max_subqueries: 3
-        # generator 未設定時沿用 generation 槽位的 LLM
 
   retrieval:
-    method: hybrid                  # 可選:bm25 / embedding / hybrid
+    method: hybrid                  # ES BM25 + kNN,RRF 融合
     method_params:
-      bm25:
-        top_k: 5
-      embedding:
-        top_k: 5
-      hybrid:                       # BM25 + 向量,RRF 融合
+      hybrid:
         top_k: 5
 
   reranking:
-    method: none                    # 可選:none / similarity / llm;鏈:[similarity, llm]
-    method_params:
-      none: {}
-      similarity:                   # cross-encoder(需 ".[st]")
-        model: cross-encoder/ms-marco-MiniLM-L-6-v2
-        top_k: 10
-      llm:                          # LLM listwise 重排
-        top_k: 5
-        # generator 未設定時沿用 generation 槽位的 LLM
+    method: none
 
   generation:
-    method: openai                    # 可選:mock / openai / gateway_openai_compatible
+    method: openai                  # 官方 OpenAI;api_key 取自 OPENAI_API_KEY
     method_params:
-      mock: {}
-      openai:                       # 官方 OpenAI(或相容 base_url)
+      openai:
         model: gpt-5-nano
-        # api_key 未設定時使用 OPENAI_API_KEY 環境變數
-        # api_base_url: http://localhost:11434/v1   # Ollama 等
-      gateway_openai_compatible:    # 公司內部閘道(可不帶 model 欄位)
-        base_url: https://llm.example.com/v1
-        api_key: YOUR_TOKEN
-        system_prompt: 只根據提供的內容回答問題。
+      mock: {}                      # 離線試跑備援(切 method 即換)
 
-  # fusion:                         # 選填:多子查詢融合 / doc、page 聚合
-  #   group_by: doc                 # none / doc / page
-  #   strategy: rrf                 # rrf / concat_dedup / max_score
-  #   top_k: 5
-
-evaluation:                         # 選填;省略則 demo 跳過評估
+evaluation:
   method: basic_retrieval_metrics
   params:
     dataset_path: ./data/eval/qa.jsonl

@@ -7,20 +7,23 @@
 ingestion:
   import:
     method: local_file
-    params:
-      input_dir: ./data/raw
-      extensions: [".txt", ".md"]   # 釘住純文字:parsing 用 plain_text 才合法
+    method_params:
+      local_file:
+        input_dir: ./data/raw
+        extensions: [".txt", ".md"] # 釘住純文字:parsing 用 plain_text 才合法
   parsing:
     method: [plain_text, clean]     # 方法鏈:轉 Document 後再清理
   chunking:
     method: fixed_size
-    params:
-      split_length: 120
-      split_overlap: 20
+    method_params:
+      fixed_size:
+        split_length: 120
+        split_overlap: 20
   embedding:
     method: mock                    # 確定性偽向量,離線可跑
-    params:
-      dim: 32
+    method_params:
+      mock:
+        dim: 32
   indexing:
     method: in_memory
 
@@ -39,17 +42,19 @@ inference:
               - "1. FAISS 支援哪些索引結構?\n2. Elasticsearch 提供哪些檢索能力?"
   retrieval:
     method: hybrid                  # BM25 + 向量,RRF 融合
-    params:
-      top_k: 4
+    method_params:
+      hybrid:
+        top_k: 4
   reranking:
     method: llm                     # LLMRanker + mock LLM(腳本化回傳排序)
-    params:
-      top_k: 4
-      generator:
-        method: mock
-        params:
-          replies:
-            - '{"documents": [{"index": 1}, {"index": 2}]}'
+    method_params:
+      llm:
+        top_k: 4
+        generator:
+          method: mock
+          params:
+            replies:
+              - '{"documents": [{"index": 1}, {"index": 2}]}'
   generation:
     method: mock
   fusion:
