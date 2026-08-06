@@ -134,6 +134,17 @@ ingestion:
         # ca_certs: /path/to/ca.crt # 預設 None:私有 CA 簽發的憑證需指定
         # verify_certs: true        # 預設 true;設 false 會失去傳輸層保護
         # incremental: false        # 預設 false(同上)
+        # --- 索引 mapping / ingest pipeline(ES plugin 場景)-------
+        # custom_mapping:           # 預設 None = 內建 mapping。完整覆蓋:
+        #   properties:             #   須自含 content 與 embedding 欄位,
+        #     content: {type: text, analyzer: ik_smart}   # dims = 模型維度
+        #     embedding: {type: dense_vector, dims: 384}
+        #   # 僅在索引不存在、由本框架建立時生效;analyzer 的**定義**
+        #   # (settings.analysis)不在 mapping 範圍,請用預建索引或
+        #   # ES index template 提供。改 mapping 會使 ingestion 指紋失效
+        #   # (需重建索引),與改切塊參數同理。
+        # ingest_pipeline: my-pipeline  # 預設 None:寫入時套用的 ES ingest
+        #                           #   pipeline 名稱(伺服器端須已建立)
 
 inference:
   query_transformation:

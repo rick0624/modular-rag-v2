@@ -10,6 +10,7 @@ from rag.builder import (
     FlexibleAPIRanker,
     _ElasticsearchParams,
     _elasticsearch_auth_kwargs,
+    _elasticsearch_store_kwargs,
     build_inference_pipeline,
     build_ingestion_pipeline,
     build_pipelines,
@@ -163,6 +164,35 @@ class TestElasticsearchAuth:
         config = self._config(basic_auth=["elastic", "secret"])
         with pytest.raises(ConfigError, match="可接受的參數:.*username"):
             build_ingestion_pipeline(config)
+
+
+class TestElasticsearchStoreKwargs:
+    """store 建構參數的組裝:選填欄位不設定就不帶,設定了原樣透傳。"""
+
+    def test_defaults_omit_optional_fields(self):
+        params = _ElasticsearchParams(hosts="http://localhost:9200")
+        kwargs = _elasticsearch_store_kwargs(params)
+        assert kwargs == {
+            "hosts": "http://localhost:9200",
+            "index": "modular-rag",
+            "embedding_similarity_function": "cosine",
+        }
+
+    def test_custom_mapping_and_ingest_pipeline_passed_through(self):
+        mapping = {
+            "properties": {
+                "content": {"type": "text", "analyzer": "ik_smart"},
+                "embedding": {"type": "dense_vector", "dims": 384},
+            }
+        }
+        params = _ElasticsearchParams(
+            hosts="http://localhost:9200",
+            custom_mapping=mapping,
+            ingest_pipeline="company-pipeline",
+        )
+        kwargs = _elasticsearch_store_kwargs(params)
+        assert kwargs["custom_mapping"] == mapping
+        assert kwargs["ingest_pipeline"] == "company-pipeline"
 
 
 class TestAPIRerankSlot:
