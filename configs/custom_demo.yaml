@@ -23,9 +23,10 @@ ingestion:
   # 語料實際上不會被 custom retrieval 用到。
   import:
     method: local_file
-    params:
-      input_dir: ./data/raw
-      extensions: [".txt", ".md"]
+    method_params:
+      local_file:
+        input_dir: ./data/raw
+        extensions: [".txt", ".md"]
   parsing:                          # custom 也能放進 parsing 鏈(鏈中 =
     method: [plain_text, custom]    # 文件處理器,契約 documents → documents)
     method_params:
@@ -38,13 +39,15 @@ ingestion:
         #   patterns: [本文件為公司內部機密]
   chunking:
     method: fixed_size
-    params:
-      split_length: 300
-      split_overlap: 50
+    method_params:
+      fixed_size:
+        split_length: 300
+        split_overlap: 50
   embedding:
     method: mock
-    params:
-      dim: 32
+    method_params:
+      mock:
+        dim: 32
   indexing:
     method: in_memory
 
@@ -64,24 +67,43 @@ inference:
 
   retrieval:
     method: custom                  # 契約:query: str → documents: list[Document]
-    params:
-      file: examples/custom_modules/company_retrieval.py
-      class: CompanyRetriever
-      init_params:
-        top_k: 5
-        # endpoint: https://km.example.com/api/search   # 接真服務時設定
+    method_params:
+      custom:
+        file: examples/custom_modules/company_retrieval.py
+        class: CompanyRetriever
+        init_params:
+          top_k: 5
+          # endpoint: https://km.example.com/api/search   # 接真服務時設定
 
   reranking:
     method: custom                  # 契約:query + documents → documents
-    params:
-      file: examples/custom_modules/company_reranker.py
-      class: KeywordOverlapReranker
-      init_params:
-        top_k: 3
+    method_params:
+      custom:
+        file: examples/custom_modules/company_reranker.py
+        class: KeywordOverlapReranker
+        init_params:
+          top_k: 3
+
+  generation:
+    method: custom                  # 契約:messages: list[ChatMessage]
+    method_params:                  #      → replies: list[ChatMessage]
+      custom:
+        file: examples/custom_modules/company_generator.py
+        class: CompanyLLMGenerator
+        # prompt 仍由框架組(這兩個選項與內建方法同款):
+        system_prompt: 你是公司內部知識庫的助理,只根據提供的內容回答。
+        # prompt_template: |        # 不設定時用內建模板
+        #   ...
+        init_params:
+          model: company-llm-v1
+          # endpoint: https://llm.example.com/v1/completions  # 設了就走真服務
+                                    # OpenAI 相容的閘道不必寫 custom,
+                                    # 直接用 gateway_openai_compatible(見 company.yaml)
 
   fusion:
     method: custom                  # 契約:results: list[list[Document]]
     params:                         #      → documents: list[Document]
+      # (fusion 槽位只支援 params,無 method_params 分區)
       file: examples/custom_modules/company_fusion.py
       class: CompanyFusion
       init_params:
@@ -89,35 +111,22 @@ inference:
     # 注意:掛了 custom 就一律執行(單一查詢也進元件);內建融合改寫
     # group_by / strategy / top_k(不可與 method: custom 混用)
 
-  routing:                          # 獨立支線:判斷類別,不影響檢索
-    method: custom                  # 契約:query: str → route: dict
-    params:
-      file: examples/custom_modules/company_router.py
-      class: CompanyQuestionRouter
-      # init_params:
-      #   rules:                    # 不設定時用範例內建規則
-      #     人資/差勤: [請假, 特休, 薪資]
-      #   default_category: 其他
-
   formatter:                        # 選填終端支線:最終結果組成對外格式,
     method: custom                  # 進 query() 輸出的 output 鍵(省略 = None)
-    params:                         # 契約:documents + query → payload: Any
-      file: examples/custom_modules/company_formatter.py
-      class: CompanyResponseBuilder
-      # init_params:
-      #   include_content: true
+    method_params:                  # 契約:documents + query → payload: Any
+      custom:
+        file: examples/custom_modules/company_formatter.py
+        class: CompanyResponseBuilder
+        # init_params:
+        #   include_content: true
 
-  generation:
-    method: custom                  # 契約:messages: list[ChatMessage]
-    params:                         #      → replies: list[ChatMessage]
-      file: examples/custom_modules/company_generator.py
-      class: CompanyLLMGenerator
-      # prompt 仍由框架組(這兩個選項與內建方法同款):
-      system_prompt: 你是公司內部知識庫的助理,只根據提供的內容回答。
-      # prompt_template: |          # 不設定時用內建模板
-      #   ...
-      init_params:
-        model: company-llm-v1
-        # endpoint: https://llm.example.com/v1/completions  # 設了就走真服務
-                                    # OpenAI 相容的閘道不必寫 custom,
-                                    # 直接用 gateway_openai_compatible(見 company.yaml)
+  routing:                          # 獨立支線:判斷類別,不影響檢索
+    method: custom                  # 契約:query: str → route: dict
+    method_params:
+      custom:
+        file: examples/custom_modules/company_router.py
+        class: CompanyQuestionRouter
+        # init_params:
+        #   rules:                  # 不設定時用範例內建規則
+        #     人資/差勤: [請假, 特休, 薪資]
+        #   default_category: 其他

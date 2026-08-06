@@ -20,7 +20,9 @@ DEMO_CONFIG = REPO_ROOT / "configs" / "custom_demo.yaml"
 def load_demo_config(corpus_dir):
     """載入真正的 custom_demo.yaml,僅把語料改指向 tmp corpus。"""
     raw = load_raw_config(DEMO_CONFIG)
-    raw["ingestion"]["import"]["params"]["input_dir"] = str(corpus_dir)
+    raw["ingestion"]["import"]["method_params"]["local_file"]["input_dir"] = str(
+        corpus_dir
+    )
     return parse_config(expand_env_vars(raw, source=str(DEMO_CONFIG)))
 
 

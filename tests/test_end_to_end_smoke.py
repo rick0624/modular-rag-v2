@@ -16,7 +16,7 @@ SMOKE_YAML = Path(__file__).resolve().parent.parent / "configs" / "smoke.yaml"
 
 def test_smoke_config_full_run(corpus_dir):
     config = load_config(SMOKE_YAML, dotenv_path=None)
-    config.ingestion.import_.params["input_dir"] = str(corpus_dir)
+    config.ingestion.import_.method_params["local_file"]["input_dir"] = str(corpus_dir)
 
     pipelines = build_pipelines(config)
     ingestion_result = pipelines.run_ingestion()

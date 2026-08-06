@@ -20,35 +20,39 @@
 ingestion:
   import:
     method: custom                  # 契約:無輸入 → sources + meta(必帶 doc_id)
-    params:
-      file: examples/custom_modules/company_importer.py
-      class: CompanyApiImporter
-      content_type: text            # 供與 parsing 的相容性檢查;省略 = 跳過
-      # init_params:
-      #   base_url: https://km.example.com/api   # 接真服務時設定
+    method_params:
+      custom:
+        file: examples/custom_modules/company_importer.py
+        class: CompanyApiImporter
+        content_type: text          # 供與 parsing 的相容性檢查;省略 = 跳過
+        # init_params:
+        #   base_url: https://km.example.com/api   # 接真服務時設定
 
   parsing:
     method: custom                  # 鏈首 converter:sources + meta → documents
-    params:
-      file: examples/custom_modules/company_parser.py
-      class: CompanyPayloadParser
-      kind: converter               # 放鏈首必須宣告(預設 doc_processor 只能放鏈中)
-      # input_content_types: [text] # 供與 import 的相容性檢查;省略 = 全收
-      # produces_pages: false       # 產生頁界時設 true(page_based chunking 的前提)
+    method_params:
+      custom:
+        file: examples/custom_modules/company_parser.py
+        class: CompanyPayloadParser
+        kind: converter             # 放鏈首必須宣告(預設 doc_processor 只能放鏈中)
+        # input_content_types: [text]   # 供與 import 的相容性檢查;省略 = 全收
+        # produces_pages: false     # 產生頁界時設 true(page_based chunking 的前提)
 
   chunking:
     method: custom                  # 契約:documents → documents(meta 逐塊複製)
-    params:
-      file: examples/custom_modules/company_chunker.py
-      class: CompanySentenceChunker
-      init_params:
-        max_chars: 120
-      # requires_pages: false       # 需要頁界時設 true
+    method_params:
+      custom:
+        file: examples/custom_modules/company_chunker.py
+        class: CompanySentenceChunker
+        init_params:
+          max_chars: 120
+        # requires_pages: false     # 需要頁界時設 true
 
   embedding:
     method: mock
-    params:
-      dim: 32
+    method_params:
+      mock:
+        dim: 32
 
   indexing:
     method: in_memory
@@ -63,10 +67,11 @@ inference:
   reranking:
     method: none
 
-  formatter:
-    method: simple_json             # 內建:通用 JSON 形狀(query / total /
-    # params:                       #   documents 清單);公司信封用 custom
-    #   include_content: true       # 預設 true;false = 只留引用資訊
-
   generation:
     method: mock
+
+  formatter:
+    method: simple_json             # 內建:通用 JSON 形狀(query / total /
+    # method_params:                #   documents 清單);公司信封用 custom
+    #   simple_json:
+    #     include_content: true     # 預設 true;false = 只留引用資訊
