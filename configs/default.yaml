@@ -145,6 +145,12 @@ ingestion:
         #   # (需重建索引),與改切塊參數同理。
         # ingest_pipeline: my-pipeline  # 預設 None:寫入時套用的 ES ingest
         #                           #   pipeline 名稱(伺服器端須已建立)
+        # request_timeout: 60       # 預設 None = client 預設 10 秒。整批 bulk
+        #                           #   寫入超過 10 秒時,writer 會拋
+        #                           #   "Connection timed out"(log 中該次
+        #                           #   _bulk 是 status:N/A、duration 剛好 10s)。
+        #                           #   但若索引 refresh_interval 很長(30s/-1),
+        #                           #   病因在那裡,調高這裡只是讓它空等。
 
 inference:
   query_transformation:

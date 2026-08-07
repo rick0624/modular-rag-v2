@@ -194,6 +194,31 @@ class TestElasticsearchStoreKwargs:
         assert kwargs["custom_mapping"] == mapping
         assert kwargs["ingest_pipeline"] == "company-pipeline"
 
+    def test_request_timeout_passed_through(self):
+        """store 未列名的參數會原樣轉給 elasticsearch client(bulk 逾時用)。"""
+        params = _ElasticsearchParams(
+            hosts="http://localhost:9200", request_timeout=60
+        )
+        assert _elasticsearch_store_kwargs(params)["request_timeout"] == 60
+
+    def test_request_timeout_must_be_positive(self):
+        with pytest.raises(ConfigError, match="request_timeout"):
+            build_ingestion_pipeline(
+                parse_config(
+                    make_config(
+                        ingestion={
+                            "indexing": {
+                                "method": "elasticsearch",
+                                "params": {
+                                    "hosts": "http://localhost:9200",
+                                    "request_timeout": 0,
+                                },
+                            }
+                        }
+                    )
+                )
+            )
+
 
 class TestAPIRerankSlot:
     """api_rerank 走完整的 config → pipeline 路徑(元件行為見 test_api_reranker)。"""
