@@ -62,14 +62,14 @@ class LLMFactChecker:
             logger.debug("事實查核回覆:%s", reply_text)
         except Exception as exc:  # fail-soft:LLM 故障不可中斷查詢路徑
             logger.warning(
-                "事實查核失敗(%s: %s),保留全部切片", type(exc).__name__, exc
+                "fail-soft:事實查核失敗(%s: %s),保留全部切片", type(exc).__name__, exc
             )
             return None
         parsed = extract_json_object(reply_text)
         indices = parsed.get("relevant_indices") if parsed else None
         if not isinstance(indices, list):
             logger.warning(
-                "事實查核輸出無法解析(%r),保留全部切片", reply_text[:80]
+                "fail-soft:事實查核輸出無法解析(%r),保留全部切片", reply_text[:80]
             )
             return None
         survivors: list[int] = []

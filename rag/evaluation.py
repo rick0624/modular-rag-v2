@@ -5,22 +5,21 @@
     {"query": "...", "relevant_doc_ids": ["doc_id", ...], "reference_answer": "..."}
 
 ``reference_answer`` 選填。評估器吃 :meth:`RagPipelines.query` 的完整
-輸出(不只 doc_id),因此日後加入生成品質指標(Ragas 等)時,只需再寫
-一個符合 :class:`Evaluator` 協定的類別並在 ``EVALUATION_FACTORIES``
-加一行,介面不需改動。
+輸出(不只 doc_id)。
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from rag.builder import RagPipelines, _validate_params, BaseParams
+from rag.builder import RagPipelines
 from rag.config import RAGConfig
 from rag.errors import ComponentError, ConfigError, UnknownMethodError
+from rag.slots import BaseParams, validate_params
 
 
 class EvalCase(BaseModel):
@@ -60,16 +59,6 @@ def load_cases(path: str | Path) -> list[EvalCase]:
     if not cases:
         raise ComponentError(f"評估資料集 '{dataset_path}' 沒有任何測試案例")
     return cases
-
-
-class Evaluator(Protocol):
-    """評估器協定:載入測試集、對查詢輸出計算指標。"""
-
-    def load_cases(self) -> list[EvalCase]: ...
-
-    def evaluate(
-        self, cases: list[EvalCase], results: list[dict[str, Any]]
-    ) -> dict[str, Any]: ...
 
 
 def _retrieved_doc_ids(result: dict[str, Any]) -> list[str]:
@@ -146,21 +135,8 @@ class _RetrievalMetricsParams(BaseParams):
     )
 
 
-def _build_retrieval_metrics(raw: dict[str, Any]) -> RetrievalMetricsEvaluator:
-    p = _validate_params(
-        "evaluation", "basic_retrieval_metrics", _RetrievalMetricsParams, raw
-    )
-    inline = [EvalCase.model_validate(case) for case in (p.cases or [])]
-    return RetrievalMetricsEvaluator(dataset_path=p.dataset_path, cases=inline)
-
-
-EVALUATION_FACTORIES: dict[str, Any] = {
-    "basic_retrieval_metrics": _build_retrieval_metrics,
-}
-
-
-def build_evaluator(config: RAGConfig) -> Evaluator:
-    """依 ``config.evaluation`` 建立評估器。
+def build_evaluator(config: RAGConfig) -> RetrievalMetricsEvaluator:
+    """依 ``config.evaluation`` 建立評估器(目前僅 basic_retrieval_metrics)。
 
     Raises:
         ConfigError: 配置沒有 evaluation 區塊。
@@ -173,9 +149,14 @@ def build_evaluator(config: RAGConfig) -> Evaluator:
         raise ConfigError(
             "模組 'evaluation' 不支援方法鏈;請指定單一方法"
         )
-    if method not in EVALUATION_FACTORIES:
-        raise UnknownMethodError("evaluation", method, list(EVALUATION_FACTORIES))
-    return EVALUATION_FACTORIES[method](config.evaluation.params_for(method))
+    if method != "basic_retrieval_metrics":
+        raise UnknownMethodError("evaluation", method, ["basic_retrieval_metrics"])
+    p = validate_params(
+        "evaluation", "basic_retrieval_metrics", _RetrievalMetricsParams,
+        config.evaluation.params_for(method),
+    )
+    inline = [EvalCase.model_validate(case) for case in (p.cases or [])]
+    return RetrievalMetricsEvaluator(dataset_path=p.dataset_path, cases=inline)
 
 
 def run_evaluation(pipelines: RagPipelines, config: RAGConfig) -> dict[str, Any]:

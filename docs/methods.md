@@ -1,7 +1,7 @@
 # 模組功能選項一覽
 
-每個模組(config 槽位)目前可用的方法,以 `rag/builder.py` 的註冊表
-(`*_FACTORIES`)為準。換方法 = 改 config 的 `method` 一行;各方法的
+每個模組(config 槽位)目前可用的方法,以 `rag/methods_ingestion.py` /
+`rag/methods_inference.py` 的註冊表(`*_FACTORIES`)為準。換方法 = 改 config 的 `method` 一行;各方法的
 參數與範例見 `configs/default.yaml`(方法型錄),輸入輸出契約見
 [interfaces.md](interfaces.md)。
 
@@ -23,12 +23,12 @@
 | | `structure_based` | 依結構遞迴切分(頁 → 段 → 行 → 句) |
 | | `page_based` | 按頁切(需要會產生頁界的 parser:pdf / auto) |
 | | `no_chunking` | 整份文件一個切片 |
-| | `custom` | 自訂切塊規則 |
-| 4 Embedding | `mock` | 離線確定性偽向量(開發測試用) |
+| | `custom` | 自訂切塊規則;可生成自訂 meta 欄位並以 `provides_fields` 宣告 |
+| 4 Embedding(皆支援 `source_field`:改用 chunking 生成的欄位做向量) | `mock` | 離線確定性偽向量(開發測試用) |
 | | `sentence_transformers` | 本地模型 🔌 `[st]` |
 | | `api_embedding` | 通用 HTTP embedding API(欄位名可對映,OpenAI 式也用它) |
-| 5 Indexing | `in_memory` | 記憶體索引(隨 process 消失;開發測試用) |
-| | `elasticsearch` | ES 索引(向量 + BM25 + filter;支援增量 ingest、自訂 mapping 與 ingest pipeline)🔌 `[es]` |
+| 5 Indexing(皆支援 `fields:` 自訂欄位白名單/改名) | `in_memory` | 記憶體索引(隨 process 消失;開發測試用) |
+| | `elasticsearch` | ES 索引(向量 + BM25 + filter;支援增量 ingest、自訂 mapping、settings 預建索引與 ingest pipeline)🔌 `[es]` |
 
 ## Inference
 
@@ -79,5 +79,5 @@
   `llm_fact_check`)都有 `generator` 參數可各自指定 LLM
   (`{method, params}`,吃 Generation 模組的任一方法);
   不設定時沿用 generation 槽位 —— 整條管線因此可以只接一個 LLM 來源。
-- **新增方法**:通用功能寫元件 + 在 `builder.py` 對應的 `*_FACTORIES`
-  加一行;公司特定邏輯直接寫 custom module,零框架改動。
+- **新增方法**:通用功能寫元件 + 在 `methods_ingestion.py` /
+  `methods_inference.py` 對應的 `*_FACTORIES` 加一行;公司特定邏輯直接寫 custom module,零框架改動。

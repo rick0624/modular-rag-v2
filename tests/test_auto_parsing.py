@@ -5,11 +5,8 @@ from __future__ import annotations
 import pytest
 from conftest import make_config
 
-from rag.builder import (
-    _local_file_output_type,
-    build_ingestion_pipeline,
-    build_pipelines,
-)
+from rag.builder import build_ingestion_pipeline, build_pipelines
+from rag.methods_ingestion import _local_file_output_type
 from rag.config import parse_config
 from rag.errors import ConfigError, IncompatiblePipelineError
 

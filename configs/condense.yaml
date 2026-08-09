@@ -15,7 +15,7 @@
 #   docker compose up -d          # 或指向既有的 ES 叢集
 #   python scripts/run_demo.py --config configs/condense.yaml
 #
-# 連線設定與 configs/home.yaml 一致:OpenAI embeddings + 本機 ES + OpenAI 生成。
+# 連線組合:OpenAI embeddings + 本機 ES + OpenAI 生成。
 # 需要的環境變數:OPENAI_API_KEY
 #
 # 注意:未啟用的示範區塊使用「字面值占位符」(如 YOUR_TOKEN),不用
@@ -57,8 +57,7 @@ ingestion:
     method_params:
       elasticsearch:
         hosts: http://localhost:9200
-        # 與 configs/home.yaml 同一個索引:embedding 模型相同(dims 一致)、
-        # 切塊設定也相同,可直接沿用已 ingest 的資料,不必重跑 ingestion。
+        # 換 embedding 模型時必須換索引名(ES dense_vector dims 建立後不可變)。
         index: modular-rag-openai-small
 
 inference:

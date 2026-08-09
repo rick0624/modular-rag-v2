@@ -9,7 +9,7 @@ from conftest import FakeClient, FakeResponse
 
 from haystack import Document
 
-from rag.components.api_reranker import FlexibleAPIRanker
+from rag.components.api_clients import FlexibleAPIRanker
 from rag.errors import APICallError, APIResponseFormatError
 
 ENDPOINT = "https://rerank.example.com/v1/rerank"

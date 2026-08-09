@@ -8,7 +8,13 @@ from pathlib import Path
 import pytest
 
 from rag.custom import CUSTOM_MODULE_PACKAGE, CustomModuleParams, instantiate_custom
-from rag.logging_config import _PROJECT_LOGGERS, default_log_path, setup_logging
+from rag.logging_config import (
+    _PROJECT_LOGGERS,
+    _WarningTally,
+    default_log_path,
+    setup_logging,
+    warning_tally,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -25,7 +31,11 @@ def _restore_logging():
         handler.close()
     root.handlers, root.level = saved[0], saved[1]
     for name, level in saved_levels.items():
-        logging.getLogger(name).setLevel(level)
+        project = logging.getLogger(name)
+        project.setLevel(level)
+        for handler in list(project.handlers):  # 摘掉殘留的警告彙整 handler
+            if isinstance(handler, _WarningTally):
+                project.removeHandler(handler)
 
 
 def test_file_gets_debug_while_console_stays_quiet(tmp_path, capsys):
@@ -131,6 +141,36 @@ class TestCustomModuleLogging:
         )
         component.run(queries=["請假規則?"])
         assert "CompanyQueryExpander" in path.read_text(encoding="utf-8")
+
+
+class TestWarningTally:
+    """警告彙整:fail-soft 讓流程「看似成功」,結束時要能總結有幾件事降級。"""
+
+    def test_collects_project_warnings_in_order(self):
+        setup_logging(None)
+        logging.getLogger("rag.components.api_clients").warning(
+            "fail-soft:rerank API 失敗"
+        )
+        logging.getLogger("_rag_custom.my_mod").warning("自訂元件警告")
+        logging.getLogger("rag.demo").info("INFO 不列入")
+        logging.getLogger("httpx").warning("第三方不列入")
+
+        tally = warning_tally()
+        assert len(tally) == 2
+        assert "rerank API 失敗" in tally[0]
+        assert "自訂元件警告" in tally[1]
+
+    def test_reset_on_each_setup(self):
+        setup_logging(None)
+        logging.getLogger("rag.demo").warning("第一輪的警告")
+        setup_logging(None)
+        assert warning_tally() == []
+
+    def test_repeated_setup_does_not_double_count(self):
+        setup_logging(None)
+        setup_logging(None)
+        logging.getLogger("rag.demo").warning("只該算一次")
+        assert len(warning_tally()) == 1
 
 
 def test_default_path_is_timestamped_under_logs():

@@ -99,7 +99,7 @@ def test_yaml_boolean_ocr_values_accepted(pdf_dir):
     """YAML 把裸寫的 off/on 解析成布林;直接接受,不強迫使用者加引號。"""
     import yaml
 
-    from rag.builder import _PdfParams
+    from rag.methods_ingestion import _PdfParams
     from rag.errors import ConfigError
 
     assert yaml.safe_load("ocr: off")["ocr"] is False  # 前提:確實變成布林

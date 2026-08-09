@@ -86,16 +86,26 @@ ingestion:
         file: ./my_chunker.py       # 或 class_path: "pkg.mod:Class"
         class: MyChunker
         # requires_pages: false     # 預設 false;需要頁界輸入時設 true
+        # provides_fields: [summary]  # 預設 None(選配):宣告元件會在切片
+        #                           #   meta 生成的欄位;宣告後 embedding 的
+        #                           #   source_field 與 indexing 的 fields
+        #                           #   引用錯欄位時建構期就報錯。不可用
+        #                           #   框架保留名(doc_id/seq/page/chunk_id/
+        #                           #   content/embedding/id)
         # init_params: {}           # 預設 {};.py 檔內容會進 ingestion 指紋
 
   embedding:
     # 可選:mock / sentence_transformers / api_embedding
     # 注意:查詢端 embedder 由此槽位派生(同向量空間紀律),
     #      換模型或維度後必須重建索引。
+    # 三個方法都支援 source_field(預設 content):文件端 embedding 改用
+    # chunking 生成的 meta 欄位當輸入(如 summary);切片缺該欄位時
+    # ingest 直接報錯。查詢端不受影響(查詢文字進同一個模型)。
     method: mock
     method_params:
       mock:                         # 離線確定性偽向量(開發測試用)
         dim: 64                     # 預設 32
+        # source_field: content     # 預設 content;可換 chunking 生成的欄位
       sentence_transformers:        # 本地模型;需 pip install -e ".[st]"
         model_name: sentence-transformers/all-MiniLM-L6-v2   # 預設值即此
       api_embedding:                # 通用 HTTP API(回應形狀見 README 對映表)
@@ -134,15 +144,25 @@ ingestion:
         # ca_certs: /path/to/ca.crt # 預設 None:私有 CA 簽發的憑證需指定
         # verify_certs: true        # 預設 true;設 false 會失去傳輸層保護
         # incremental: false        # 預設 false(同上)
-        # --- 索引 mapping / ingest pipeline(ES plugin 場景)-------
+        # --- 自訂欄位白名單 + 改名(in_memory 也支援)---------------
+        # fields:                   # 預設 None = 自訂 meta 欄位全帶。設定後
+        #   summary_text: summary   #   = 白名單:{索引欄位名: meta 欄位名},
+        #   dept: department        #   未列出的自訂欄位不寫入;框架欄位
+        #                           #   (doc_id/chunk_id/seq/page)與 content/
+        #                           #   embedding 永遠保留。改映射請重建索引
+        #                           #   (增量 ingest 不會回填已跳過的切片)。
+        # --- 索引 mapping / settings / ingest pipeline --------------
         # custom_mapping:           # 預設 None = 內建 mapping。完整覆蓋:
         #   properties:             #   須自含 content 與 embedding 欄位,
         #     content: {type: text, analyzer: ik_smart}   # dims = 模型維度
         #     embedding: {type: dense_vector, dims: 384}
-        #   # 僅在索引不存在、由本框架建立時生效;analyzer 的**定義**
-        #   # (settings.analysis)不在 mapping 範圍,請用預建索引或
-        #   # ES index template 提供。改 mapping 會使 ingestion 指紋失效
-        #   # (需重建索引),與改切塊參數同理。
+        #   # 僅在索引不存在、由框架建立時生效。改 mapping 會使 ingestion
+        #   # 指紋失效(需重建索引),與改切塊參數同理。
+        # settings:                 # 預設 None。analyzer 定義等 index settings
+        #   analysis:               #   (Haystack 原生只吃 mapping,設定本參數
+        #     analyzer: {...}       #   時由框架在索引不存在時預建索引);
+        #                           #   必須搭配 custom_mapping,且建 pipeline
+        #                           #   時就會連線 ES 檢查索引是否存在。
         # ingest_pipeline: my-pipeline  # 預設 None:寫入時套用的 ES ingest
         #                           #   pipeline 名稱(伺服器端須已建立)
 
@@ -342,9 +362,3 @@ evaluation:                         # 選填;省略則 demo 跳過評估
     dataset_path: ./data/eval/qa.jsonl
     # cases:                        # 或直接行內給案例(與 dataset_path 擇一)
     #   - {query: "...", relevant_doc_ids: ["faiss.txt"]}
-
-# haystack_pipelines:               # 選填 escape hatch:某階段改用原生
-#                                   # Haystack pipeline YAML,跳過槽位組裝與
-#                                   # 相容性檢查(該階段的槽位區塊必須省略)
-#   ingestion: ./pipelines/native_ingestion.yaml
-#   inference: ./pipelines/native_inference.yaml

@@ -27,8 +27,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 FINGERPRINT_KEY = "modular_rag_ingestion_fingerprint"
 _STORE_ATTR = "_modular_rag_ingestion_fingerprint"
@@ -90,7 +93,8 @@ def custom_file_hashes(ingestion: Any) -> dict[str, str]:
     中 method 含 "custom" 的槽位,依 ``params_for`` 的優先序
     (``method_params.custom`` 蓋過 ``params``)取 ``file`` 並雜湊其內容。
     檔案讀不到(路徑含未展開的 ``${ENV_VAR}``、或建索引的主機上沒這個檔)
-    時該槽位靜默退回 path-only —— 指紋仍含路徑字串,只是看不見內容變更。
+    時該槽位記 WARNING 並退回 path-only —— 指紋仍含路徑字串,
+    只是看不見內容變更。
     """
     hashes: dict[str, str] = {}
     if not isinstance(ingestion, dict):
@@ -113,8 +117,15 @@ def custom_file_hashes(ingestion: Any) -> dict[str, str]:
             continue
         try:
             digest = hashlib.sha256(Path(file).read_bytes()).hexdigest()
-        except (OSError, ValueError):
-            continue  # path-only 退路:路徑字串本來就在指紋裡
+        except (OSError, ValueError) as exc:
+            # path-only 退路:路徑字串本來就在指紋裡,但檔案內容的變更
+            # 從此偵測不到 —— 必須出聲,否則改了切塊邏輯不會被要求重建。
+            logger.warning(
+                "fail-soft:讀不到 %s 槽位的 custom 檔案 '%s'(%s),"
+                "指紋退回 path-only(該檔內容變更將偵測不到)",
+                slot, file, exc,
+            )
+            continue
         hashes[slot] = digest
     return hashes
 
@@ -149,6 +160,7 @@ def _es_read_meta(store: Any, index_name: str | None) -> dict[str, Any]:
     try:
         mapping = store.client.indices.get_mapping(index=index_name)
     except NotFoundError:  # 索引還不存在 = 從未 ingest 過
+        logger.debug("索引 %s 不存在,視為從未 ingest", index_name)
         return {}
     return mapping[index_name]["mappings"].get("_meta") or {}
 

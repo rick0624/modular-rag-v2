@@ -51,8 +51,9 @@ from rag.logging_config import (  # noqa: E402
     default_log_path,
     quiet_dependency_handlers,
     setup_logging,
+    warning_tally,
 )
-from rag.sample_data import ensure_sample_data  # noqa: E402
+from sample_data import ensure_sample_data  # noqa: E402
 from rag.trace import (  # noqa: E402
     snippet,
     format_ingestion_trace,
@@ -151,55 +152,24 @@ def _report_skipped_ingestion(
     print(f"跳過 ingestion(索引 '{index_name}' 的 ingestion 指紋相符)")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="modular-rag-v2 端到端 demo")
-    parser.add_argument(
-        "--config", default="configs/default.yaml", help="YAML 設定檔路徑"
+def _report_warnings(log_path) -> None:
+    """執行結束時總結本次警告:fail-soft 讓流程「看似成功」,這裡出聲。"""
+    warnings = warning_tally()
+    if not warnings:
+        return
+    print(
+        f"\n⚠ 本次執行有 {len(warnings)} 則警告"
+        "(可能含 fail-soft 降級 —— 流程完成但部分步驟已退化):"
     )
-    parser.add_argument("--query", default="FAISS 支援哪些索引結構?", help="查詢文字")
-    parser.add_argument(
-        "--stage",
-        default="all",
-        choices=["all", "ingestion", "inference"],
-        help="這次跑哪一段:all=ingestion → 查詢 → 評估(預設);"
-        "ingestion=只建索引(並寫 ingestion 指紋);"
-        "inference=只查詢 + 評估,索引沿用既有內容"
-        "(elasticsearch 會比對 ingestion 指紋)",
-    )
-    parser.add_argument(
-        "--trace",
-        action="store_true",
-        help="終端機也逐步印出每個元件的輸入輸出(log 檔一律完整記錄)",
-    )
-    parser.add_argument(
-        "--trace-docs",
-        type=int,
-        default=5,
-        help="--trace 時終端機每步最多印幾筆切片(0 = 全印;預設 5)",
-    )
-    parser.add_argument(
-        "--log-file",
-        default=None,
-        help="log 檔路徑(預設 logs/run-<時間戳>.log)",
-    )
-    parser.add_argument(
-        "--no-log-file", action="store_true", help="不寫 log 檔"
-    )
-    parser.add_argument(
-        "--log-level",
-        default="WARNING",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="終端機的日誌層級(log 檔一律 DEBUG;預設 WARNING)",
-    )
-    args = parser.parse_args()
+    for message in warnings[:5]:
+        print(f"  - {message[:110]}")
+    if len(warnings) > 5:
+        print(f"  …其餘 {len(warnings) - 5} 則")
+    if log_path is not None:
+        print(f"完整內容見 log:{log_path}")
 
-    # tqdm 進度條不走 logging,只能靠環境變數關;要在 ML 套件載入前設定。
-    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
-    log_file = None if args.no_log_file else (args.log_file or default_log_path())
-    log_path = setup_logging(log_file, console_level=args.log_level)
-
+def _run(args, log_path) -> None:
     ensure_sample_data()  # 範例語料與評估集(已存在的檔案不覆寫)
     config = load_config(args.config)
     logger.info("=" * 70)
@@ -293,6 +263,66 @@ def main() -> None:
 
     if log_path is not None:
         print(f"紀錄:{log_path}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="modular-rag-v2 端到端 demo")
+    parser.add_argument(
+        "--config", default="configs/default.yaml", help="YAML 設定檔路徑"
+    )
+    parser.add_argument("--query", default="FAISS 支援哪些索引結構?", help="查詢文字")
+    parser.add_argument(
+        "--stage",
+        default="all",
+        choices=["all", "ingestion", "inference"],
+        help="這次跑哪一段:all=ingestion → 查詢 → 評估(預設);"
+        "ingestion=只建索引(並寫 ingestion 指紋);"
+        "inference=只查詢 + 評估,索引沿用既有內容"
+        "(elasticsearch 會比對 ingestion 指紋)",
+    )
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="終端機也逐步印出每個元件的輸入輸出(log 檔一律完整記錄)",
+    )
+    parser.add_argument(
+        "--trace-docs",
+        type=int,
+        default=5,
+        help="--trace 時終端機每步最多印幾筆切片(0 = 全印;預設 5)",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="log 檔路徑(預設 logs/run-<時間戳>.log)",
+    )
+    parser.add_argument(
+        "--no-log-file", action="store_true", help="不寫 log 檔"
+    )
+    parser.add_argument(
+        "--log-level",
+        default="WARNING",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="終端機的日誌層級(log 檔一律 DEBUG;預設 WARNING)",
+    )
+    args = parser.parse_args()
+
+    # tqdm 進度條不走 logging,只能靠環境變數關;要在 ML 套件載入前設定。
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
+    log_file = None if args.no_log_file else (args.log_file or default_log_path())
+    log_path = setup_logging(log_file, console_level=args.log_level)
+
+    try:
+        _run(args, log_path)
+    except Exception:
+        # 例外預設只進 stderr,不進 log 檔 —— 這裡補上,事後查 log 檔
+        # 才看得到這次執行是「失敗」而不是「沒跑完」。
+        logger.exception("執行失敗(未捕捉的例外),traceback 如下")
+        raise
+    finally:
+        _report_warnings(log_path)
 
 
 if __name__ == "__main__":

@@ -12,9 +12,12 @@ MultiQueryRetrievalStage(inner pipeline);這裡負責另外兩件事:
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import networkx
+
+logger = logging.getLogger(__name__)
 
 
 def step_order(pipeline: Any) -> list[str]:
@@ -29,6 +32,10 @@ def step_order(pipeline: Any) -> list[str]:
     try:
         return list(networkx.topological_sort(pipeline.graph))
     except networkx.NetworkXUnfeasible:
+        logger.warning(
+            "fail-soft:pipeline 圖含環,無法拓撲排序;步驟順序退回元件"
+            "加入順序(trace 的先後可能與實際執行不符)"
+        )
         return list(pipeline.graph.nodes)
 
 

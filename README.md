@@ -7,8 +7,9 @@
 保留 v1 的操作體驗與契約:**槽位式單一 YAML 配置**(換方法只改一行)、
 建構期相容性檢查、繁中錯誤訊息(指出收到什麼 / 期望什麼 / 該改哪個
 欄位 / 可用替代)、離線可跑的測試文化。自維護程式碼從整套框架縮減為
-一個薄 builder(`rag/builder.py`):方法名稱 → Haystack 元件的對映表
-加上接線邏輯。
+一個薄 builder:方法型錄(`rag/methods_ingestion.py` /
+`rag/methods_inference.py`,方法名稱 → Haystack 元件)加上接線邏輯
+(`rag/builder.py`)。
 
 ## 架構總覽
 
@@ -26,8 +27,8 @@ Evaluation: JSONL 測試集 → 逐題查詢 → hit rate / MRR
 | import | **local_file**(萬用:txt/md/pdf,`extensions` 可收窄) / custom | 自訂 FileLister(相對路徑 doc_id)/ 自訂元件(公司 DMS / API) |
 | parsing | **auto**(依檔案類型分流) / plain_text / pdf / clean(鏈用) / custom(鏈首或鏈中,`kind` 宣告);pdf 支援 `ocr: off/auto/force` | FileTypeRouter + 自訂 PdfToDocument(pypdf + rapidocr)+ DocumentCleaner |
 | chunking | **fixed_size** / structure_based / page_based / no_chunking / custom | (Recursive)DocumentSplitter,一律字元單位 / 自訂元件(公司切塊規則) |
-| embedding | **mock** / sentence_transformers / api_embedding | ST 整合套件 / 自訂 Flexible API embedder |
-| indexing | **in_memory** / elasticsearch(皆支援 `incremental: true` 增量 ingest) | InMemory / Elasticsearch DocumentStore |
+| embedding | **mock** / sentence_transformers / api_embedding;皆支援 `source_field`(選任一 chunking 生成欄位做向量) | ST 整合套件 / 自訂 Flexible API embedder |
+| indexing | **in_memory** / elasticsearch(皆支援 `incremental: true` 增量 ingest 與 `fields:` 欄位白名單/改名;ES 另支援 custom_mapping + settings 預建索引) | InMemory / Elasticsearch DocumentStore |
 | query_transformation | **normalize** / passthrough / glossary / jargon_mapping / llm_rewrite / llm_decompose / custom | 自訂元件(`list[str] → list[str]`) |
 | retrieval | **bm25** / embedding / hybrid(皆支援 `boost_k_factor` 候選放大) / custom | 依 indexing 選 retriever;hybrid 走 RRF |
 | reranking | **none** / similarity / api_rerank / llm / llm_fact_check / custom | ST cross-encoder / 自訂 Flexible API ranker / core LLMRanker / 自訂 LLMFactChecker |
@@ -100,8 +101,7 @@ python scripts/run_demo.py --config configs/docs.yaml --stage inference --query 
 程式接入時對應 `build_pipelines(config, stage=...)`:沒建的那條在
 `RagPipelines` 上是 `None`,誤呼叫 `run_ingestion()` / `query()` 會直接
 報錯並指明要怎麼重建。服務端對應 `create_app(path, stage=...)` 與
-`rag.service.ingest_only(path)`。`serve.py --skip-ingest` 保留為
-`--stage inference` 的舊寫法。
+`rag.service.ingest_only(path)`。
 
 ### 逐步紀錄(trace)
 
@@ -154,7 +154,22 @@ log 檔是 UTF-8。Windows PowerShell 5.1 的 `Get-Content` 預設用系統 ANSI
 Get-Content logs\run-20260802-154249.log -Encoding UTF8
 ```
 
+**每個步驟不論成敗都有紀錄**:pipeline 每一步執行完都寫一行 INFO
+(元件名稱 + 產出筆數,一律進 log 檔);fail-soft 機制(API 掛掉保留原
+順序、LLM 故障退回原查詢…)降級時記 WARNING,訊息帶 `fail-soft:` 前綴
+(`grep fail-soft logs/run-*.log` 可一次找出所有降級)。執行結束時終端機
+會總結:
+
+```
+⚠ 本次執行有 1 則警告(可能含 fail-soft 降級 —— 流程完成但部分步驟已退化):
+  - rag.components.api_clients: fail-soft:rerank API 失敗(...),保留原檢索順序前 5 筆
+```
+
+沒有這行就代表全程沒有任何降級 ——「跑完了」和「每一步都真的成功」
+從此分得開。未捕捉的例外也會連 traceback 寫進 log 檔(不再只進 stderr)。
+
 程式接入用 `rag.logging_config.setup_logging(log_file, console_level)`;
+執行後可用 `rag.logging_config.warning_tally()` 取得本次全部警告;
 排版函式在 `rag.trace`(`format_ingestion_trace` / `format_query_trace`),
 終端機與 log 檔共用同一份實作。
 
@@ -314,8 +329,10 @@ process 內),`/reload` 與 `--stage inference` 啟動時比對,不符即拒絕
 - **增量 ingest**(`indexing.params.incremental: true`,`docs.yaml` 已開),
   兩層:**檔案層** —— 內容未變的檔案連 parse(含 OCR)都跳過(檔案
   bytes 雜湊記在索引旁的 manifest;parsing/chunking 設定變更會使 manifest
-  作廢、全量重 parse);**切片層** —— 變更檔案中內容未變的切片跳過
-  embedding。回應的 `skipped_files` / `skipped_unchanged` 顯示兩層跳過量;
+  作廢、全量重 parse);**切片層** —— 變更檔案中「content 與被 embed 的
+  欄位(`source_field`)」皆未變的切片跳過 embedding。注意:只改
+  `indexing.params.fields` 映射時,增量不會回填已跳過的切片,請重建索引
+  或關 incremental 全量跑一次。回應的 `skipped_files` / `skipped_unchanged` 顯示兩層跳過量;
   `documents_written: 0` 表示這次沒有任何變更。
 - **空來源回報**:沒有產出任何切片的檔案(掃描檔沒 OCR、解析失敗…)
   會出現在回應的 `empty_sources` 與 log 警告中,不會靜默消失。
@@ -381,20 +398,10 @@ config 中所有字串支援 `${ENV_VAR}` 佔位符,載入時展開;引用未設
 變數**直接報錯**並指名變數。機密因此不進版控。變數可放 `.env`
 (自動載入;真正的環境變數優先)。要輸出字面值 `${...}` 寫 `$${...}`。
 
-### Escape hatch(原生 Haystack pipeline)
-
-槽位式組不出來的圖形狀,可直接掛原生 pipeline YAML(專家模式,
-跳過相容性檢查;與該階段的槽位區塊互斥):
-
-```yaml
-haystack_pipelines:
-  inference: pipelines/exotic_graph.yaml   # Pipeline.dumps() 的輸出
-```
-
 ## 如何新增一個自訂方法
 
 兩條路:**custom module**(路 A,推薦 —— 零框架改動,程式碼留在你自己
-的 repo)與**進框架型錄**(路 B —— 改 builder.py,成為所有人可選的方法)。
+的 repo)與**進框架型錄**(路 B —— 改方法型錄檔,成為所有人可選的方法)。
 
 ### 路 A:custom module(`method: custom`)
 
@@ -506,20 +513,23 @@ class BySentenceSplitter:
 - 注意:custom module 就是執行任意 Python 程式碼,與 config 檔同一
   信任層級,只載入你信任的來源。
 
-### 路 B:進框架型錄(改 `rag/builder.py`)
+### 路 B:進框架型錄(改 `rag/methods_inference.py` 或 `rag/methods_ingestion.py`)
 
-**1. 寫元件**(同上)。**2. 寫 factory 並加進對映表**:
+**1. 寫元件**(同上)。**2. 寫 factory 並加進對映表**(inference 端方法
+改 `rag/methods_inference.py`,ingestion 端改 `rag/methods_ingestion.py`):
 
 ```python
 class _BySentenceParams(BaseParams):   # extra="forbid":打錯參數直接報錯
     pass
 
 def _build_by_sentence(raw, ctx):
-    _validate_params("query_transformation", "by_sentence", _BySentenceParams, raw)
+    validate_params("query_transformation", "by_sentence", _BySentenceParams, raw)
     return BySentenceSplitter()
 
 TRANSFORM_FACTORIES["by_sentence"] = SlotFactory(build=_build_by_sentence)
 ```
+
+(`BaseParams` / `validate_params` / `SlotFactory` 都在 `rag/slots.py`。)
 
 **3. 在 YAML 改 `method: by_sentence`**。
 

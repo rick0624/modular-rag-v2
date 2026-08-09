@@ -223,22 +223,9 @@ inference:
             load_config(config_path, dotenv_path=tmp_path / ".env")
 
 
-class TestEscapeHatch:
-    def test_stage_section_and_native_pipeline_are_exclusive(self):
-        data = make_config(haystack_pipelines={"inference": "pipelines/exotic.yaml"})
-        with pytest.raises(ConfigError, match=r"haystack_pipelines\.inference"):
-            parse_config(data)
-
-    def test_stage_must_come_from_somewhere(self):
+class TestRequiredStages:
+    def test_both_stages_must_be_present(self):
         data = make_config()
         del data["inference"]
         with pytest.raises(ConfigError, match="缺少 'inference' 配置"):
             parse_config(data)
-
-    def test_native_pipeline_replaces_stage_section(self):
-        data = make_config()
-        del data["inference"]
-        data["haystack_pipelines"] = {"inference": "pipelines/exotic.yaml"}
-        config = parse_config(data)
-        assert config.inference is None
-        assert config.haystack_pipelines.inference == "pipelines/exotic.yaml"
