@@ -441,6 +441,16 @@ class _ElasticsearchParams(_IndexingCommonParams):
         default=None,
         description="寫入文件時套用的 ES ingest pipeline 名稱(伺服器端須已建立)",
     )
+    request_timeout: float | None = Field(
+        default=None,
+        gt=0,
+        description="單次 ES 請求的逾時秒數(client 預設 10)。整批 bulk 寫入"
+        "在資料量大或線路慢時會超過 10 秒 —— 症狀是 writer 步驟拋 "
+        "'Connection timed out',log 中該次 _bulk 請求是 status:N/A、"
+        "duration 恰好等於逾時值。注意:若索引的 refresh_interval 設得很長"
+        "(公司 index template 常見 30s / -1),寫入預設會等下一次 refresh,"
+        "此時調高本參數只是讓它願意空等 —— 病因在 refresh_interval",
+    )
 
     @model_validator(mode="after")
     def _settings_require_mapping(self) -> "_ElasticsearchParams":
@@ -495,6 +505,10 @@ def _elasticsearch_store_kwargs(p: _ElasticsearchParams) -> dict[str, Any]:
         kwargs["custom_mapping"] = p.custom_mapping
     if p.ingest_pipeline is not None:
         kwargs["ingest_pipeline"] = p.ingest_pipeline
+    if p.request_timeout is not None:
+        # store 未列名的參數會原樣轉給 elasticsearch client(document_store
+        # 的 **kwargs → Elasticsearch(...)),request_timeout 走這條路。
+        kwargs["request_timeout"] = p.request_timeout
     return kwargs
 
 

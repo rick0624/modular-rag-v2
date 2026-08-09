@@ -208,6 +208,31 @@ class TestElasticsearchStoreKwargs:
         kwargs = _elasticsearch_store_kwargs(params)
         assert "settings" not in kwargs and "fields" not in kwargs
 
+    def test_request_timeout_passed_through(self):
+        """store 未列名的參數會原樣轉給 elasticsearch client(bulk 逾時用)。"""
+        params = _ElasticsearchParams(
+            hosts="http://localhost:9200", request_timeout=60
+        )
+        assert _elasticsearch_store_kwargs(params)["request_timeout"] == 60
+
+    def test_request_timeout_must_be_positive(self):
+        with pytest.raises(ConfigError, match="request_timeout"):
+            build_ingestion_pipeline(
+                parse_config(
+                    make_config(
+                        ingestion={
+                            "indexing": {
+                                "method": "elasticsearch",
+                                "params": {
+                                    "hosts": "http://localhost:9200",
+                                    "request_timeout": 0,
+                                },
+                            }
+                        }
+                    )
+                )
+            )
+
 
 class TestElasticsearchIndexSettings:
     """settings 預建索引:需搭配 custom_mapping;已存在的索引不動。"""
