@@ -7,13 +7,15 @@ import pytest
 from conftest import make_config
 
 from rag.builder import (
-    FlexibleAPIRanker,
-    _ElasticsearchParams,
-    _elasticsearch_auth_kwargs,
-    _elasticsearch_store_kwargs,
     build_inference_pipeline,
     build_ingestion_pipeline,
     build_pipelines,
+)
+from rag.components.api_clients import FlexibleAPIRanker
+from rag.methods_ingestion import (
+    _ElasticsearchParams,
+    _elasticsearch_auth_kwargs,
+    _elasticsearch_store_kwargs,
 )
 from rag.config import parse_config
 from rag.errors import ConfigError, UnknownMethodError
@@ -193,6 +195,85 @@ class TestElasticsearchStoreKwargs:
         kwargs = _elasticsearch_store_kwargs(params)
         assert kwargs["custom_mapping"] == mapping
         assert kwargs["ingest_pipeline"] == "company-pipeline"
+
+    def test_settings_and_fields_not_leaked_to_store(self):
+        # settings 由框架預建索引使用、fields 由 MetaFieldMapper 使用,
+        # 都不是 ElasticsearchDocumentStore 的建構參數。
+        params = _ElasticsearchParams(
+            hosts="http://localhost:9200",
+            custom_mapping={"properties": {}},
+            settings={"analysis": {}},
+            fields={"summary_text": "summary"},
+        )
+        kwargs = _elasticsearch_store_kwargs(params)
+        assert "settings" not in kwargs and "fields" not in kwargs
+
+
+class TestElasticsearchIndexSettings:
+    """settings 預建索引:需搭配 custom_mapping;已存在的索引不動。"""
+
+    def test_settings_without_custom_mapping_rejected(self):
+        config = parse_config(
+            make_config(
+                ingestion={
+                    "indexing": {
+                        "method": "elasticsearch",
+                        "params": {
+                            "hosts": "http://localhost:9200",
+                            "settings": {"analysis": {}},
+                        },
+                    }
+                }
+            )
+        )
+        with pytest.raises(ConfigError, match="settings 需要搭配 custom_mapping"):
+            build_ingestion_pipeline(config)
+
+    class _StubClient:
+        def __init__(self, exists: bool) -> None:
+            self._exists = exists
+            self.created: dict | None = None
+            outer = self
+
+            class _Indices:
+                def exists(self, index):
+                    return outer._exists
+
+                def create(self, index, mappings, settings):
+                    outer.created = {
+                        "index": index, "mappings": mappings, "settings": settings
+                    }
+
+            self.indices = _Indices()
+
+    def test_ensure_es_index_creates_when_missing(self):
+        from rag.methods_ingestion import _ensure_es_index
+
+        params = _ElasticsearchParams(
+            hosts="http://localhost:9200",
+            index="kb",
+            custom_mapping={"properties": {}},
+            settings={"analysis": {"analyzer": {}}},
+        )
+        client = self._StubClient(exists=False)
+        _ensure_es_index(client, params)
+        assert client.created == {
+            "index": "kb",
+            "mappings": {"properties": {}},
+            "settings": {"analysis": {"analyzer": {}}},
+        }
+
+    def test_ensure_es_index_skips_existing(self):
+        from rag.methods_ingestion import _ensure_es_index
+
+        params = _ElasticsearchParams(
+            hosts="http://localhost:9200",
+            custom_mapping={"properties": {}},
+            settings={},
+        )
+        client = self._StubClient(exists=True)
+        _ensure_es_index(client, params)
+        assert client.created is None
 
 
 class TestAPIRerankSlot:
@@ -547,62 +628,3 @@ class TestFormatterSlot:
         result = pipelines.query("向量檢索")
         assert result["answer"] == "答案"
         assert result["output"]["total"] >= 1
-
-
-def test_native_pipeline_stage_requires_build_pipelines():
-    data = make_config()
-    del data["ingestion"]
-    data["haystack_pipelines"] = {"ingestion": "pipelines/native.yaml"}
-    config = parse_config(data)
-    with pytest.raises(ConfigError, match="build_pipelines"):
-        build_ingestion_pipeline(config)
-
-
-class TestEscapeHatch:
-    def _native_inference_config(self, tmp_path, corpus_dir):
-        from haystack import Pipeline
-        from haystack.components.builders import PromptBuilder
-
-        native = Pipeline()
-        native.add_component("prompt_builder", PromptBuilder(template="Q: {{ q }}"))
-        path = tmp_path / "native_inference.yaml"
-        path.write_text(native.dumps(), encoding="utf-8")
-
-        data = make_config(
-            ingestion={
-                "import": {
-                    "method": "local_file",
-                    "params": {"input_dir": str(corpus_dir), "extensions": [".txt"]},
-                }
-            }
-        )
-        del data["inference"]
-        data["haystack_pipelines"] = {"inference": str(path)}
-        return parse_config(data)
-
-    def test_native_inference_loads_and_disables_query_helper(
-        self, tmp_path, corpus_dir
-    ):
-        config = self._native_inference_config(tmp_path, corpus_dir)
-        pipelines = build_pipelines(config)
-        assert pipelines.query_entry is None
-        # 原生 pipeline 本身可直接執行
-        out = pipelines.inference.run({"prompt_builder": {"q": "hi"}})
-        assert out["prompt_builder"]["prompt"] == "Q: hi"
-        # query() 便利介面明確拒絕並指路
-        with pytest.raises(ConfigError, match="原生 Haystack YAML"):
-            pipelines.query("hi")
-
-    def test_native_pipeline_missing_file(self, corpus_dir):
-        data = make_config(
-            ingestion={
-                "import": {
-                    "method": "local_file",
-                    "params": {"input_dir": str(corpus_dir), "extensions": [".txt"]},
-                }
-            }
-        )
-        del data["inference"]
-        data["haystack_pipelines"] = {"inference": "does/not/exist.yaml"}
-        with pytest.raises(ConfigError, match="找不到 haystack_pipelines 指定的檔案"):
-            build_pipelines(parse_config(data))

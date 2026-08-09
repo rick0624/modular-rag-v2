@@ -208,12 +208,12 @@ class LLMQueryRewriter:
             reply_text = result["replies"][0].text or ""
             logger.debug("查詢改寫回覆:%s", reply_text)
         except Exception as exc:  # fail-soft:LLM 故障不可中斷查詢路徑
-            logger.warning("查詢改寫失敗(%s: %s),退回原查詢", type(exc).__name__, exc)
+            logger.warning("fail-soft:查詢改寫失敗(%s: %s),退回原查詢", type(exc).__name__, exc)
             return query
         parsed = extract_json_object(reply_text)
         rewritten = parsed.get("rewritten_query") if parsed else None
         if not isinstance(rewritten, str) or not rewritten.strip():
-            logger.warning("查詢改寫輸出無法解析(%r),退回原查詢", reply_text[:80])
+            logger.warning("fail-soft:查詢改寫輸出無法解析(%r),退回原查詢", reply_text[:80])
             return query
         return rewritten.strip()
 
@@ -262,7 +262,7 @@ class LLMQueryDecomposer:
             reply_text = result["replies"][0].text or ""
             logger.debug("查詢拆解回覆:%s", reply_text)
         except Exception as exc:  # fail-soft:LLM 故障不可中斷查詢路徑
-            logger.warning("查詢拆解失敗(%s: %s),退回原查詢", type(exc).__name__, exc)
+            logger.warning("fail-soft:查詢拆解失敗(%s: %s),退回原查詢", type(exc).__name__, exc)
             return [query]
         subqueries = []
         for line in reply_text.splitlines():
@@ -270,7 +270,7 @@ class LLMQueryDecomposer:
             if cleaned:
                 subqueries.append(cleaned)
         if not subqueries:
-            logger.warning("查詢拆解輸出無法解析(%r),退回原查詢", reply_text[:80])
+            logger.warning("fail-soft:查詢拆解輸出無法解析(%r),退回原查詢", reply_text[:80])
             return [query]
         return subqueries[: self.max_subqueries]
 

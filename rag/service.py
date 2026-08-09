@@ -113,15 +113,12 @@ class ServiceState:
     lock: threading.Lock
 
 
-_indexing_info = indexing_info  # 與 kb_meta 共用同一實作
-
-
 def _run_ingest_and_stamp(
     pipelines: RagPipelines, config: RAGConfig, fingerprint: str
 ) -> dict[str, Any]:
     """跑 ingestion 並在成功後寫入指紋(先跑後寫:失敗不留新指紋)。"""
     result = pipelines.run_ingestion()
-    method, index_name = _indexing_info(config)
+    method, index_name = indexing_info(config)
     write_fingerprint(method, pipelines.store, fingerprint, index_name)
     return result
 
@@ -193,7 +190,7 @@ def create_app(config_path: str | Path, *, stage: str = "all") -> Any:
     pipelines = build_pipelines(config, stage=stage)
 
     if skip_ingest:
-        method, index_name = _indexing_info(config)
+        method, index_name = indexing_info(config)
         stored = read_fingerprint(method, pipelines.store, index_name)
         if method == "elasticsearch" and stored != fingerprint:
             raise ConfigError(
@@ -227,11 +224,17 @@ def create_app(config_path: str | Path, *, stage: str = "all") -> Any:
 
     @app.exception_handler(RAGFrameworkError)
     async def _framework_error(request: Request, exc: RAGFrameworkError) -> JSONResponse:
+        # 伺服器端也要留紀錄:只回 400 給 client 的話,server log 完全
+        # 看不到這次請求為什麼被拒,事後無從追查。
+        logger.warning(
+            "請求被拒(%s %s):%s: %s",
+            request.method, request.url.path, type(exc).__name__, exc,
+        )
         return JSONResponse(status_code=400, content={"detail": str(exc)})
 
     @app.get("/health", response_model=HealthResponse)
     def health() -> Any:
-        method, _ = _indexing_info(state.pipelines.config)
+        method, _ = indexing_info(state.pipelines.config)
         return HealthResponse(
             status="ok",
             config_path=str(state.config_path),

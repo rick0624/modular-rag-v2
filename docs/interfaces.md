@@ -39,6 +39,11 @@ custom module(`method: custom`)掛進槽位時,元件的 socket 必須符合上�
 融合後另帶 `group_key`(聚合鍵)、`num_merged`(合併筆數)、`sources`
 (各來源的子查詢/名次/分數)。
 
+custom chunker 可額外生成自訂 meta 欄位(建議以 `provides_fields` 宣告,
+供建構期檢查),下游可引用:embedding 的 `source_field` 選它做向量、
+indexing 的 `fields` 決定寫入索引的欄位與名稱。自訂欄位不可使用框架
+保留名(doc_id/seq/page/chunk_id/content/embedding/id)。
+
 ## 3. 不變量(修改程式時不可破壞)
 
 - **分數**:越大越相關、結果降冪;只在同一次結果內可比(不可跨方法比較)。
@@ -62,6 +67,10 @@ custom module(`method: custom`)掛進槽位時,元件的 socket 必須符合上�
    indexing 方法宣告能力的子集。
 4. **custom socket**:custom 元件的輸入輸出 socket 必須符合 §1 契約;
    額外輸出允許(自動進 trace),契約外的必填輸入不允許。
+5. **欄位引用**:chunking 宣告了 `provides_fields` 時,embedding 的
+   `source_field` 與 indexing 的 `fields` 引用未宣告欄位即報錯;
+   `incremental: true` 且被 embed 的自訂欄位不在 `fields` 白名單時
+   也報錯(欄位須寫入索引才能在下次 ingest 比對)。
 
 ## 5. 服務模式要點
 
@@ -77,5 +86,4 @@ custom module(`method: custom`)掛進槽位時,元件的 socket 必須符合上�
    公司特定的寫 custom module(零框架改動)。九成需求在這裡。
 2. 資料要多帶資訊 → 加 meta 鍵(只加不改)。
 3. 新檔案型別 → 副檔名對映 + `auto` 加一條分流。
-4. 流程真的要多一步 → 改 `builder.py` 組裝邏輯;極端形狀走
-   `haystack_pipelines` escape hatch(原生 pipeline YAML)。
+4. 流程真的要多一步 → 改 `rag/builder.py` 的組裝邏輯。

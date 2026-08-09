@@ -1,13 +1,9 @@
-"""YAML 配置的 schema 定義與載入。
+"""YAML 配置的 schema 定義與載入(含 ${ENV_VAR} 展開與 .env 載入)。
 
 整條 pipeline 由單一 YAML config 控制:每個槽位指定 ``method`` 與該
 方法專屬的 ``params``。這裡只驗證「結構層」(每個槽位都要有 method /
-params);``params`` 內容的驗證交給 builder 中各方法的 factory,
+params);``params`` 內容的驗證交給各方法型錄的 factory,
 因此新增方法時完全不需改動本檔案。
-
-進階用法(escape hatch):頂層 ``haystack_pipelines`` 可為某個階段
-直接指定原生 Haystack pipeline YAML 檔,跳過槽位組裝與相容性檢查;
-該階段的槽位區塊必須同時省略(兩者互斥)。
 """
 
 from __future__ import annotations
@@ -20,11 +16,67 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from rag.dotenv import load_dotenv
 from rag.errors import ConfigError
 
 _ENV_VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _ESCAPE_SENTINEL = "\x00ESCAPED_DOLLAR_BRACE\x00"
+
+# --- .env 載入(不依賴 python-dotenv)--------------------------------------
+
+_DOTENV_LINE_PATTERN = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+
+
+def _parse_dotenv(text: str, source: str = ".env") -> dict[str, str]:
+    """把 .env 內容解析成 dict(不寫入環境變數)。
+
+    支援 ``KEY=value``、``export`` 前綴、單/雙引號包裹的值、
+    未加引號值的行內註解(以「空白 + #」分隔)。
+
+    Raises:
+        ConfigError: 任一行不是 ``KEY=value`` 格式。
+    """
+    values: dict[str, str] = {}
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = _DOTENV_LINE_PATTERN.match(line)
+        if match is None:
+            raise ConfigError(
+                f"'{source}' 第 {line_number} 行格式不正確:{raw_line!r}"
+                "(應為 KEY=value)"
+            )
+        key, value = match.group(1), match.group(2).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        else:
+            # 未加引號的值:移除行內註解(以「空白 + #」分隔)。
+            value = value.split(" #", 1)[0].rstrip()
+        values[key] = value
+    return values
+
+
+def load_dotenv(path: str | Path = ".env", *, override: bool = False) -> dict[str, str]:
+    """讀取 .env 檔並寫入 ``os.environ``;檔案不存在時安靜跳過。
+
+    預設不覆蓋已存在的環境變數(export / 系統設定優先於 .env)。
+
+    Returns:
+        實際寫入環境的變數 dict(被跳過的不含在內)。
+
+    Raises:
+        ConfigError: 檔案存在但內容格式不正確。
+    """
+    env_path = Path(path)
+    if not env_path.is_file():
+        return {}
+    values = _parse_dotenv(env_path.read_text(encoding="utf-8"), source=str(env_path))
+    applied: dict[str, str] = {}
+    for key, value in values.items():
+        if override or key not in os.environ:
+            os.environ[key] = value
+            applied[key] = value
+    return applied
 
 
 def _expand_env_in_str(text: str, source: str) -> str:
@@ -261,60 +313,27 @@ class InferenceConfig(BaseModel):
         return self
 
 
-class HaystackPipelinesConfig(BaseModel):
-    """Escape hatch:各階段直接載入原生 Haystack pipeline YAML。
-
-    指定某階段時,該階段的槽位區塊必須省略(互斥);載入的 pipeline
-    跳過槽位組裝與相容性檢查(專家模式,自行負責圖的正確性)。
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    ingestion: str | None = Field(
-        default=None, description="ingestion 階段的原生 Haystack pipeline YAML 路徑"
-    )
-    inference: str | None = Field(
-        default=None, description="inference 階段的原生 Haystack pipeline YAML 路徑"
-    )
-
-
 class RAGConfig(BaseModel):
-    """整條 pipeline 的頂層配置。
-
-    每個階段(ingestion / inference)必須恰好由一種方式提供:
-    槽位區塊,或 ``haystack_pipelines`` 中的原生 pipeline 路徑。
-    """
+    """整條 pipeline 的頂層配置(ingestion 與 inference 皆必填)。"""
 
     model_config = ConfigDict(extra="forbid")
 
     ingestion: IngestionConfig | None = Field(
-        default=None, description="Ingestion 槽位配置(與 haystack_pipelines.ingestion 互斥)"
+        default=None, description="Ingestion 槽位配置"
     )
     inference: InferenceConfig | None = Field(
-        default=None, description="Inference 槽位配置(與 haystack_pipelines.inference 互斥)"
+        default=None, description="Inference 槽位配置"
     )
     evaluation: MethodConfig | None = Field(
         default=None, description="Evaluation 配置(可省略)"
     )
-    haystack_pipelines: HaystackPipelinesConfig | None = Field(
-        default=None, description="Escape hatch:各階段的原生 Haystack pipeline YAML"
-    )
 
     @model_validator(mode="after")
-    def _each_stage_exactly_one_source(self) -> "RAGConfig":
-        native = self.haystack_pipelines
+    def _both_stages_present(self) -> "RAGConfig":
         for stage in ("ingestion", "inference"):
-            slot_section = getattr(self, stage)
-            native_path = getattr(native, stage) if native is not None else None
-            if slot_section is not None and native_path is not None:
+            if getattr(self, stage) is None:
                 raise ValueError(
-                    f"'{stage}' 槽位區塊與 'haystack_pipelines.{stage}' 互斥,"
-                    f"兩者只能擇一;請移除其中一個"
-                )
-            if slot_section is None and native_path is None:
-                raise ValueError(
-                    f"缺少 '{stage}' 配置:請提供 '{stage}' 槽位區塊,"
-                    f"或以 'haystack_pipelines.{stage}' 指定原生 pipeline YAML"
+                    f"缺少 '{stage}' 配置:請提供 '{stage}' 槽位區塊"
                 )
         return self
 

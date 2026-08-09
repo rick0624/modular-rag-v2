@@ -8,7 +8,7 @@ from conftest import FakeClient, FakeResponse
 
 from haystack import Document
 
-from rag.components.api_embedders import (
+from rag.components.api_clients import (
     FlexibleAPIDocumentEmbedder,
     FlexibleAPITextEmbedder,
 )

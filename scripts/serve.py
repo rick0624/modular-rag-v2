@@ -39,8 +39,9 @@ from rag.logging_config import (  # noqa: E402
     default_log_path,
     quiet_dependency_handlers,
     setup_logging,
+    warning_tally,
 )
-from rag.sample_data import ensure_sample_data  # noqa: E402
+from sample_data import ensure_sample_data  # noqa: E402
 from rag.service import create_app, ingest_only  # noqa: E402
 
 logger = logging.getLogger("rag.serve")
@@ -60,11 +61,6 @@ def main() -> None:
         help="這個 process 做哪一段:all=啟動時 ingest 一次再開服務(預設);"
         "ingestion=只建索引就結束(不開 port);"
         "inference=跳過啟動 ingestion(索引已建好,會比對 ingestion 指紋)",
-    )
-    parser.add_argument(
-        "--skip-ingest",
-        action="store_true",
-        help="等同 --stage inference(舊旗標,保留相容)",
     )
     parser.add_argument(
         "--log-file", default=None, help="log 檔路徑(預設 logs/serve-<時間戳>.log)"
@@ -91,17 +87,18 @@ def main() -> None:
     if log_path is not None:
         print(f"完整紀錄:{log_path}")
 
-    if args.skip_ingest and args.stage == "ingestion":
-        parser.error(
-            "--skip-ingest 是 --stage inference 的舊寫法,與 --stage ingestion 互斥"
-        )
-    stage = "inference" if args.skip_ingest else args.stage
+    stage = args.stage
 
     ensure_sample_data()  # 範例語料與評估集(已存在的檔案不覆寫)
 
     if stage == "ingestion":
         # 只建索引:不開 port,建完就結束(讀寫分離部署的 writer 端)。
-        result = ingest_only(args.config)
+        try:
+            result = ingest_only(args.config)
+        except Exception:
+            # 例外預設只進 stderr —— 補進 log 檔,排程 / CI 事後可查。
+            logger.exception("ingestion 失敗(未捕捉的例外),traceback 如下")
+            raise
         quiet_dependency_handlers()
         written = (result.get("writer") or {}).get("documents_written") or 0
         print(f"已索引 {written} 個切片({args.config})")
@@ -112,10 +109,20 @@ def main() -> None:
                 f"⚠ 以下檔案沒有產出任何切片(掃描檔需要 OCR?詳見 log):"
                 f"{'、'.join(empty_sources)}"
             )
+        warnings = warning_tally()
+        if warnings:
+            print(
+                f"⚠ 本次 ingestion 有 {len(warnings)} 則警告"
+                "(可能含 fail-soft 降級),詳見 log"
+            )
         print("(--stage ingestion:未啟動服務;查詢請以 --stage inference 起另一個 process)")
         return
 
-    app = create_app(args.config, stage=stage)
+    try:
+        app = create_app(args.config, stage=stage)
+    except Exception:
+        logger.exception("服務啟動失敗(未捕捉的例外),traceback 如下")
+        raise
     quiet_dependency_handlers()  # 建 pipeline 時才載入的套件(HF…)補一次
 
     import uvicorn

@@ -46,6 +46,34 @@ class _MuteNoisyDeps(logging.Filter):
         return not record.name.startswith(_CONSOLE_MUTED)
 
 
+class _WarningTally(logging.Handler):
+    """收集本專案 logger 樹的 WARNING+ 訊息,供執行結束時彙報。
+
+    fail-soft 機制(API 掛掉保留原順序、LLM 故障退回原查詢…)讓流程
+    「看似成功」;個別警告會即時印出,但長輸出裡容易被滑掉。這個
+    handler 把它們累積起來,結束時一次總結:「這次執行有幾件事降級了」。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(f"{record.name}: {record.getMessage()}")
+
+
+_tally: _WarningTally | None = None
+
+
+def warning_tally() -> list[str]:
+    """回傳自上次 :func:`setup_logging` 以來,本專案發出的 WARNING+ 訊息。
+
+    只收 ``rag.*`` 與 ``_rag_custom.*``(第三方套件的警告不算),依發生
+    順序;供 CLI 在執行結束時總結「有哪些步驟降級了」。
+    """
+    return list(_tally.messages) if _tally is not None else []
+
+
 def default_log_path(directory: str | Path = "logs") -> Path:
     """產生帶時間戳的預設路徑,避免多次執行互相覆蓋。"""
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -89,13 +117,20 @@ def setup_logging(
     Returns:
         實際寫入的 log 檔路徑(``log_file`` 為 None 時回傳 None)。
     """
+    global _tally
     root = logging.getLogger()
     for handler in list(root.handlers):  # 重複呼叫不要疊 handler(訊息會重複)
         root.removeHandler(handler)
         handler.close()
     root.setLevel(getattr(logging, console_level))
+    _tally = _WarningTally()  # 每次 setup 重置(舊 handler 一併換掉)
     for name in _PROJECT_LOGGERS:
-        logging.getLogger(name).setLevel(logging.DEBUG)
+        project_logger = logging.getLogger(name)
+        project_logger.setLevel(logging.DEBUG)
+        for handler in list(project_logger.handlers):
+            if isinstance(handler, _WarningTally):
+                project_logger.removeHandler(handler)
+        project_logger.addHandler(_tally)
     for name in _FILE_VERBOSE:
         logging.getLogger(name).setLevel(logging.INFO if log_file else logging.NOTSET)
 

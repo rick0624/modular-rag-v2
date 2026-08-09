@@ -1,12 +1,16 @@
-"""Question routing 元件:判斷查詢類別,結果附加於輸出。
+"""Inference 的兩條選填支線元件:routing(查詢分類)與 formatter(對外格式)。
 
-routing 是 inference 的獨立支線:吃「原始」查詢(不經 transform 鏈)、
-輸出 ``route: dict``、圖上沒有下游 —— 判斷結果不影響檢索行為,
-由 ``RagPipelines.query()`` 收進回傳值的 ``routing`` key 與 trace。
+兩者都不影響檢索:
 
-內建的 :class:`KeywordRouteClassifier` 是展示/測試用的簡單規則分類;
-正式場景(domain knowhow 的分類模型、規則引擎)請用 ``method: custom``
-接自訂元件,契約同樣是 ``query: str → route: dict[str, Any]``。
+- :class:`KeywordRouteClassifier`(``routing: keyword_match``):獨立支線,
+  吃「原始」查詢(不經 transform 鏈)、輸出 ``route: dict``、圖上沒有
+  下游 —— 結果由 ``query()`` 收進回傳值的 ``routing`` 鍵與 trace。
+- :class:`SimpleJsonFormatter`(``formatter: simple_json``):終端支線
+  (fusion 之後,與 prompt → generation 並聯),把融合後的文件組成
+  **對外**格式,進 ``query()`` 回傳值的 ``output`` 鍵;canonical 鍵照舊。
+
+正式場景(分類模型、公司信封)請用 ``method: custom`` 接自訂元件,
+契約見 README「如何新增一個自訂方法」節。
 """
 
 from __future__ import annotations
@@ -14,7 +18,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from haystack import component
+from haystack import Document, component
 
 from rag.errors import ComponentError
 
@@ -77,4 +81,44 @@ class KeywordRouteClassifier:
                 "confidence": round(best_confidence, 4),
                 "matched_keywords": best_matched,
             }
+        }
+
+
+@component
+class SimpleJsonFormatter:
+    """把融合後的文件組成通用 JSON 形狀。
+
+    輸出形狀::
+
+        {
+          "query": 原始查詢,
+          "total": 筆數,
+          "documents": [
+            {"doc_id", "chunk_id", "page", "score", "content"(選配)}, ...
+          ],
+        }
+
+    Args:
+        include_content: 是否包含切片內文(只要引用資訊時設 false,
+            回應可以小很多)。
+    """
+
+    def __init__(self, include_content: bool = True) -> None:
+        self.include_content = include_content
+
+    @component.output_types(payload=dict[str, Any])
+    def run(self, documents: list[Document], query: str) -> dict[str, Any]:
+        rows = []
+        for doc in documents:
+            row: dict[str, Any] = {
+                "doc_id": doc.meta.get("doc_id"),
+                "chunk_id": doc.meta.get("chunk_id"),
+                "page": doc.meta.get("page"),
+                "score": doc.score,
+            }
+            if self.include_content:
+                row["content"] = doc.content
+            rows.append(row)
+        return {
+            "payload": {"query": query, "total": len(rows), "documents": rows}
         }

@@ -254,7 +254,7 @@ def test_non_path_sources_always_reparse(tmp_path, caplog):
     import logging
 
     caplog.clear()  # 只驗證第二輪的警告數
-    with caplog.at_level(logging.WARNING, logger="rag.components.source_filter"):
+    with caplog.at_level(logging.WARNING, logger="rag.components.ingestion_steps"):
         second = pipelines.run_ingestion()
     assert second["source_filter"]["skipped_files"] == []  # 沒有檔案層跳過
     assert second["source_filter"]["manifest"]["files"] == {}  # 不記入 manifest
