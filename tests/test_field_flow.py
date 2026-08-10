@@ -405,6 +405,16 @@ class TestExtraVectorsChecks:
         with pytest.raises(ConfigError, match="與.*既有欄位重名"):
             build_ingestion_pipeline(config)
 
+    def test_fields_may_reference_vector_fields(self, tmp_path, corpus_dir):
+        # 向量欄位可列入 fields 白名單(改名用),不算「未宣告」
+        config = _field_config(
+            tmp_path, corpus_dir,
+            source_field="content",
+            extra_vectors={"summary_vector": "summary"},
+            indexing_params={"fields": {"sum_vec": "summary_vector"}},
+        )
+        build_ingestion_pipeline(config)  # 不應拋錯
+
     def test_incremental_requires_extra_sources_in_whitelist(
         self, tmp_path, corpus_dir
     ):
@@ -498,3 +508,26 @@ def test_extra_vectors_end_to_end(tmp_path):
     # 重跑無變更:全跳過,不重寫
     result2 = pipelines.run_ingestion()
     assert result2["writer"]["documents_written"] == 0
+
+
+def test_extra_vectors_renamed_via_fields(tmp_path):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "a.txt").write_text("摘要行\n\n內文。", encoding="utf-8")
+
+    config = _field_config(
+        tmp_path, raw,
+        source_field="content",
+        extra_vectors={"summary_vector": "summary"},
+        indexing_params={
+            "fields": {
+                "sum_vec": "summary_vector",   # 向量欄位改名
+                "summary_text": "summary",
+            },
+        },
+    )
+    pipelines = build_pipelines(config, stage="ingestion")
+    pipelines.run_ingestion()
+    doc = pipelines.store.filter_documents()[0]
+    assert doc.meta["sum_vec"] == mock_vector("摘要行", 16)
+    assert "summary_vector" not in doc.meta  # 已改名,不重複保留原名
