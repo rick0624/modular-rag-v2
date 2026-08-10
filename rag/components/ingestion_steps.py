@@ -9,8 +9,9 @@
   upsert 語意的基石。
 - :class:`IncrementalChangeFilter`(``incremental: true``):切片層增量 ——
   內容沒變的切片跳過 embedding 與寫入。
-- :class:`FieldSourceEmbedder`(``embedding.source_field`` 非 content 時):
-  讓文件端 embedder 改用指定 meta 欄位當輸入。
+- :class:`FieldSourceEmbedder`(``embedding.source_field`` 非 content 或
+  設定 ``extra_vectors`` 時):讓文件端 embedder 改用指定 meta 欄位當
+  輸入,並可對額外欄位各出一組向量寫進 meta。
 - :class:`MetaFieldMapper`(``indexing.params.fields`` 設定時):寫入前
   依白名單挑選/改名自訂 meta 欄位。
 
@@ -249,9 +250,10 @@ class IncrementalChangeFilter:
     相同的切片直接跳過,只有新增或變更的切片才往下走 embedding → 寫入。
 
     比對看 ``content`` 與**實際被 embed 的欄位**(``source_field``,
-    預設就是 content):任一變了就放行。store 端該欄位可能被 indexing 的
-    ``fields`` 改名後才寫入,所以用 ``stored_field`` 讀。meta 其他欄位
-    變了但這兩者沒變的切片不會重寫,屬可接受的取捨。來源檔案**刪除**後
+    預設就是 content;``extra_vectors`` 的各來源欄位也算):任一變了就
+    放行。store 端這些欄位可能被 indexing 的 ``fields`` 改名後才寫入,
+    所以每組比對都帶 (來源欄位, store 端欄位) 名字對。meta 其他欄位
+    變了但這些都沒變的切片不會重寫,屬可接受的取捨。來源檔案**刪除**後
     的舊切片不在此元件的守備範圍(它只看這次進來的切片),與全量 ingest
     的 upsert 語意一致:要乾淨索引請刪索引重建。
     """
@@ -261,10 +263,20 @@ class IncrementalChangeFilter:
         store: Any,
         source_field: str = "content",
         stored_field: str = "content",
+        extra_fields: list[tuple[str, str]] | None = None,
     ) -> None:
+        """
+        Args:
+            store: 目標 document store。
+            source_field: 主向量的輸入欄位(切片端名字)。
+            stored_field: 主向量輸入欄位在 store 端的名字(可能被改名)。
+            extra_fields: extra_vectors 各來源欄位的 (切片端, store 端)
+                名字對;這些欄位任一變更也要放行重 embed。
+        """
         self.store = store
         self.source_field = source_field
         self.stored_field = stored_field
+        self.extra_fields = list(extra_fields or [])
 
     def _embed_value(self, doc: Document, field: str) -> Any:
         if field == "content":
@@ -275,8 +287,12 @@ class IncrementalChangeFilter:
     def run(self, documents: list[Document]) -> dict[str, Any]:
         if not documents:
             return {"documents": [], "skipped": 0}
+        pairs = [(self.source_field, self.stored_field), *self.extra_fields]
         existing = {
-            doc.id: (doc.content or "", self._embed_value(doc, self.stored_field))
+            doc.id: (
+                doc.content or "",
+                *(self._embed_value(doc, stored) for _, stored in pairs),
+            )
             for doc in self.store.filter_documents(
                 filters={
                     "field": "id",
@@ -287,13 +303,13 @@ class IncrementalChangeFilter:
         }
         changed: list[Document] = []
         for doc in documents:
-            embed_value = self._embed_value(doc, self.source_field)
+            current = [self._embed_value(doc, source) for source, _ in pairs]
             # 缺值一律放行:讓下游 embedder 的 fail-fast 出聲,
             # 而不是兩邊都 None 相等而被無聲跳過。
-            if embed_value is None:
+            if any(value is None for value in current):
                 changed.append(doc)
                 continue
-            if existing.get(doc.id) != (doc.content or "", embed_value):
+            if existing.get(doc.id) != (doc.content or "", *current):
                 changed.append(doc)
         skipped = len(documents) - len(changed)
         if skipped:
@@ -306,16 +322,25 @@ class IncrementalChangeFilter:
 
 @component
 class FieldSourceEmbedder:
-    """讓任一文件端 embedder 改用 ``meta[source_field]`` 當輸入。
+    """讓任一文件端 embedder 改用指定欄位當輸入,並可加出額外向量。
 
-    做法:把欄位值暫代 content 交給內部 embedder,embed 完把向量抄回
-    **原** Document(content 與 meta 都不變)。欄位缺值(None / 空字串 /
-    非字串)直接報錯 —— 無聲 fallback 會讓向量空間混入兩種語意。
+    主向量:把 ``meta[source_field]`` 暫代 content 交給內部 embedder,
+    embed 完把向量抄回**原** Document(content 與 meta 都不變)。
+    額外向量(``extra_vectors``,{向量欄位名: 來源欄位},共用同一個
+    embedder):逐組以來源欄位再 embed 一輪,結果寫進 ``meta[向量欄位名]``,
+    隨 meta 落入索引。任何來源欄位缺值(None / 空字串 / 非字串)直接
+    報錯 —— 無聲 fallback 會讓向量空間混入兩種語意。
     """
 
-    def __init__(self, inner: Any, source_field: str) -> None:
+    def __init__(
+        self,
+        inner: Any,
+        source_field: str,
+        extra_vectors: dict[str, str] | None = None,
+    ) -> None:
         self.inner = inner
         self.source_field = source_field
+        self.extra_vectors = dict(extra_vectors or {})
 
     def warm_up(self) -> None:
         # Pipeline 只對圖上節點呼叫 warm_up;inner 不在圖上,由這裡委派
@@ -323,34 +348,59 @@ class FieldSourceEmbedder:
         if hasattr(self.inner, "warm_up"):
             self.inner.warm_up()
 
+    def _embed_from(
+        self, documents: list[Document], field: str, param_desc: str
+    ) -> list[Any]:
+        """以指定來源欄位跑一輪內部 embedder,回傳向量清單(順序對應輸入)。"""
+        if field != "content":
+            missing = [
+                doc.meta.get("chunk_id") or doc.id
+                for doc in documents
+                if not isinstance(doc.meta.get(field), str)
+                or not doc.meta[field].strip()
+            ]
+            if missing:
+                listed = ", ".join(str(item) for item in missing[:5])
+                more = f" 等共 {len(missing)} 筆" if len(missing) > 5 else ""
+                raise ComponentError(
+                    f"embedding 的 {param_desc} 在以下切片"
+                    f"缺值或不是非空字串:{listed}{more}。"
+                    "請確認 chunking 元件對每個切片都生成該欄位"
+                )
+        # content 也走影子複本:有些 embedder 會就地改動傳入的 Document。
+        shadows = [
+            dataclasses.replace(
+                doc, content=doc.content if field == "content" else doc.meta[field]
+            )
+            for doc in documents
+        ]
+        embedded = self.inner.run(documents=shadows)["documents"]
+        return [doc.embedding for doc in embedded]
+
     @component.output_types(documents=list[Document])
     def run(self, documents: list[Document]) -> dict[str, Any]:
         if not documents:
             return {"documents": []}
-        missing = [
-            doc.meta.get("chunk_id") or doc.id
-            for doc in documents
-            if not isinstance(doc.meta.get(self.source_field), str)
-            or not doc.meta[self.source_field].strip()
-        ]
-        if missing:
-            listed = ", ".join(str(item) for item in missing[:5])
-            more = f" 等共 {len(missing)} 筆" if len(missing) > 5 else ""
-            raise ComponentError(
-                f"embedding 的 source_field '{self.source_field}' 在以下切片"
-                f"缺值或不是非空字串:{listed}{more}。"
-                "請確認 chunking 元件對每個切片都生成該欄位"
-                "(或把 source_field 改回 content)"
+        main = self._embed_from(
+            documents, self.source_field, f"source_field '{self.source_field}'"
+        )
+        extras = {
+            vec_name: self._embed_from(
+                documents, src, f"extra_vectors 來源欄位 '{src}'"
             )
-        shadows = [
-            dataclasses.replace(doc, content=doc.meta[self.source_field])
-            for doc in documents
-        ]
-        embedded = self.inner.run(documents=shadows)["documents"]
+            for vec_name, src in self.extra_vectors.items()
+        }
         return {
             "documents": [
-                dataclasses.replace(original, embedding=shadow.embedding)
-                for original, shadow in zip(documents, embedded)
+                dataclasses.replace(
+                    doc,
+                    embedding=main[i],
+                    meta={
+                        **doc.meta,
+                        **{name: vectors[i] for name, vectors in extras.items()},
+                    },
+                )
+                for i, doc in enumerate(documents)
             ]
         }
 
@@ -360,22 +410,28 @@ class MetaFieldMapper:
     """依 ``fields``(ES 欄位名 → meta 欄位名)重整 meta(白名單 + 改名)。
 
     放在 embedder 之後、writer 之前。框架欄位(doc_id / chunk_id / seq /
-    page)永遠保留;其餘 meta 只保留映射中列出者,並以 ES 欄位名寫出。
-    meta 缺某個映射欄位時略過(不塞 None,免得污染 ES mapping)。
-    content 與 embedding 是 Document 本體,不受影響。
+    page)與 ``preserve`` 列出的欄位(如 extra_vectors 的向量欄位,由框架
+    生成、不屬 chunking 的自訂欄位)永遠原名保留;其餘 meta 只保留映射中
+    列出者,並以 ES 欄位名寫出。meta 缺某個映射欄位時略過(不塞 None,
+    免得污染 ES mapping)。content 與 embedding 是 Document 本體,不受影響。
     """
 
     FRAMEWORK_FIELDS = ("doc_id", "chunk_id", "seq", "page")
 
-    def __init__(self, fields: dict[str, str]) -> None:
+    def __init__(
+        self, fields: dict[str, str], preserve: tuple[str, ...] = ()
+    ) -> None:
         self.fields = dict(fields)
+        self.preserve = tuple(preserve)
 
     @component.output_types(documents=list[Document])
     def run(self, documents: list[Document]) -> dict[str, Any]:
         mapped: list[Document] = []
         for doc in documents:
             meta = {
-                key: doc.meta[key] for key in self.FRAMEWORK_FIELDS if key in doc.meta
+                key: doc.meta[key]
+                for key in (*self.FRAMEWORK_FIELDS, *self.preserve)
+                if key in doc.meta
             }
             for es_name, meta_name in self.fields.items():
                 if meta_name in doc.meta:

@@ -216,10 +216,13 @@ def build_ingestion_pipeline(
         ing.embedding.params_for(embedding_method), ctx
     )
 
-    # --- 欄位引用檢查:embedding 的 source_field 與 indexing 的 fields ---
+    # --- 欄位引用檢查:embedding 的輸入欄位與 indexing 的 fields ---
     # (params 已在各 factory.build 過 pydantic 驗證,這裡讀 raw dict 安全)
     source_field = ing.embedding.params_for(embedding_method).get(
         "source_field", "content"
+    )
+    extra_vectors: dict[str, str] = (
+        ing.embedding.params_for(embedding_method).get("extra_vectors") or {}
     )
     es_fields = ing.indexing.params_for(indexing_method).get("fields")
     declared = chunking_provides_fields(
@@ -235,30 +238,55 @@ def build_ingestion_pipeline(
                 f"embedding 的 source_field '{source_field}' 不在 chunking 宣告的"
                 f"欄位中。可用欄位:{listed}"
             )
+        for vec_name, vec_source in extra_vectors.items():
+            if vec_source not in available:
+                raise ConfigError(
+                    f"embedding 的 extra_vectors 來源欄位 '{vec_source}'"
+                    f"(向量欄位 '{vec_name}')不在 chunking 宣告的欄位中。"
+                    f"可用欄位:{listed}"
+                )
+        vec_collisions = sorted(set(extra_vectors) & available)
+        if vec_collisions:
+            raise ConfigError(
+                f"embedding 的 extra_vectors 向量欄位名 {vec_collisions} 與"
+                "既有欄位重名(向量會覆蓋 meta 中的原值),請改用其他名字"
+            )
         for es_name, meta_name in (es_fields or {}).items():
             if meta_name not in available:
                 raise ConfigError(
                     f"indexing 的 fields 引用了未宣告的 meta 欄位 '{meta_name}'"
                     f"(ES 欄位 '{es_name}')。可用欄位:{listed}"
                 )
-    if (
-        incremental
-        and source_field != "content"
-        and es_fields is not None
-        and source_field not in es_fields.values()
-    ):
-        raise ConfigError(
-            f"incremental: true 且 embedding 以 '{source_field}' 為輸入時,"
-            "indexing 的 fields 白名單必須包含該欄位(寫進索引才能在下次"
-            "ingest 比對它是否變更)"
+    embed_sources = [source_field, *extra_vectors.values()]
+    if incremental and es_fields is not None:
+        unlisted = sorted(
+            {src for src in embed_sources
+             if src != "content" and src not in es_fields.values()}
         )
+        if unlisted:
+            names = ", ".join(repr(src) for src in unlisted)
+            raise ConfigError(
+                f"incremental: true 且 embedding 以 {names} 為輸入時,"
+                "indexing 的 fields 白名單必須包含該欄位(寫進索引才能在下次"
+                "ingest 比對它是否變更)"
+            )
+
     # 被 embed 的欄位在 store 端的名字:可能被 fields 改名後才寫入。
-    stored_field = source_field
-    if es_fields is not None and source_field != "content":
-        stored_field = next(
-            (es for es, meta in es_fields.items() if meta == source_field),
-            source_field,
+    def _stored_name(field: str) -> str:
+        if es_fields is None or field == "content":
+            return field
+        return next(
+            (es for es, meta in es_fields.items() if meta == field), field
         )
+
+    stored_field = _stored_name(source_field)
+    # extra_vectors 各來源欄位的 (切片端, store 端) 名字對,供增量比對;
+    # content 已是主比對項,不重複列。
+    extra_change_fields = [
+        (src, _stored_name(src))
+        for src in extra_vectors.values()
+        if src != "content"
+    ]
 
     pipeline = Pipeline()
     pipeline.add_component("importer", lister)
@@ -324,14 +352,21 @@ def build_ingestion_pipeline(
         pipeline.add_component(
             "change_filter",
             IncrementalChangeFilter(
-                store, source_field=source_field, stored_field=stored_field
+                store,
+                source_field=source_field,
+                stored_field=stored_field,
+                extra_fields=extra_change_fields,
             ),
         )
         docs_chain.append("change_filter")
     docs_chain.append("embedder")
     if es_fields is not None:
-        # 寫入前的欄位白名單 + 改名(僅自訂欄位;框架欄位固定保留)。
-        pipeline.add_component("field_mapper", MetaFieldMapper(es_fields))
+        # 寫入前的欄位白名單 + 改名(僅自訂欄位;框架欄位與 extra_vectors
+        # 的向量欄位固定保留)。
+        pipeline.add_component(
+            "field_mapper",
+            MetaFieldMapper(es_fields, preserve=tuple(extra_vectors)),
+        )
         docs_chain.append("field_mapper")
     docs_chain.append("writer")
     for upstream, downstream in zip(docs_chain, docs_chain[1:]):

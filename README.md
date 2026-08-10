@@ -27,7 +27,7 @@ Evaluation: JSONL 測試集 → 逐題查詢 → hit rate / MRR
 | import | **local_file**(萬用:txt/md/pdf,`extensions` 可收窄) / custom | 自訂 FileLister(相對路徑 doc_id)/ 自訂元件(公司 DMS / API) |
 | parsing | **auto**(依檔案類型分流) / plain_text / pdf / clean(鏈用) / custom(鏈首或鏈中,`kind` 宣告);pdf 支援 `ocr: off/auto/force` | FileTypeRouter + 自訂 PdfToDocument(pypdf + rapidocr)+ DocumentCleaner |
 | chunking | **fixed_size** / structure_based / page_based / no_chunking / custom | (Recursive)DocumentSplitter,一律字元單位 / 自訂元件(公司切塊規則) |
-| embedding | **mock** / sentence_transformers / api_embedding;皆支援 `source_field`(選任一 chunking 生成欄位做向量) | ST 整合套件 / 自訂 Flexible API embedder |
+| embedding | **mock** / sentence_transformers / api_embedding;皆支援 `source_field`(選任一 chunking 生成欄位做向量)與 `extra_vectors`(同一模型對額外欄位各出一組向量) | ST 整合套件 / 自訂 Flexible API embedder |
 | indexing | **in_memory** / elasticsearch(皆支援 `incremental: true` 增量 ingest 與 `fields:` 欄位白名單/改名;ES 另支援 custom_mapping + settings 預建索引) | InMemory / Elasticsearch DocumentStore |
 | query_transformation | **normalize** / passthrough / glossary / jargon_mapping / llm_rewrite / llm_decompose / custom | 自訂元件(`list[str] → list[str]`) |
 | retrieval | **bm25** / embedding / hybrid(皆支援 `boost_k_factor` 候選放大) / custom | 依 indexing 選 retriever;hybrid 走 RRF |
