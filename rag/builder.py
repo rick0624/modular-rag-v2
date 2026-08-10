@@ -251,11 +251,15 @@ def build_ingestion_pipeline(
                 f"embedding 的 extra_vectors 向量欄位名 {vec_collisions} 與"
                 "既有欄位重名(向量會覆蓋 meta 中的原值),請改用其他名字"
             )
+        # fields 另可引用 extra_vectors 的向量欄位(改名用);沒列的
+        # 向量欄位不受白名單影響,一律原名保留。
+        indexable = available | set(extra_vectors)
+        listed_indexable = ", ".join(repr(name) for name in sorted(indexable))
         for es_name, meta_name in (es_fields or {}).items():
-            if meta_name not in available:
+            if meta_name not in indexable:
                 raise ConfigError(
                     f"indexing 的 fields 引用了未宣告的 meta 欄位 '{meta_name}'"
-                    f"(ES 欄位 '{es_name}')。可用欄位:{listed}"
+                    f"(ES 欄位 '{es_name}')。可用欄位:{listed_indexable}"
                 )
     embed_sources = [source_field, *extra_vectors.values()]
     if incremental and es_fields is not None:
@@ -361,11 +365,15 @@ def build_ingestion_pipeline(
         docs_chain.append("change_filter")
     docs_chain.append("embedder")
     if es_fields is not None:
-        # 寫入前的欄位白名單 + 改名(僅自訂欄位;框架欄位與 extra_vectors
-        # 的向量欄位固定保留)。
+        # 寫入前的欄位白名單 + 改名(僅自訂欄位;框架欄位固定保留)。
+        # extra_vectors 的向量欄位:列入 fields 的走映射(可改名),
+        # 沒列的自動保留原名 —— 不因白名單而被丟棄。
+        preserve = tuple(
+            name for name in extra_vectors if name not in es_fields.values()
+        )
         pipeline.add_component(
             "field_mapper",
-            MetaFieldMapper(es_fields, preserve=tuple(extra_vectors)),
+            MetaFieldMapper(es_fields, preserve=preserve),
         )
         docs_chain.append("field_mapper")
     docs_chain.append("writer")

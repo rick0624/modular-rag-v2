@@ -106,7 +106,9 @@ ingestion:
     # (欄位名不可用框架保留名、不可與既有欄位重名)。ES 上要對額外向量
     # 做 kNN 須在 custom_mapping 宣告同名 dense_vector 欄位,否則落入
     # dynamic mapping 變普通 float 陣列;查詢端內建檢索只用主向量
-    # (embedding),額外向量供 custom retrieval 使用。
+    # (embedding),額外向量供 custom retrieval 使用。向量欄位**不需**
+    # 列入 indexing 的 fields 白名單(未列出時自動原名保留);要改
+    # 索引端名字時才列入(如 {sum_vec: summary_vector})。
     method: mock
     method_params:
       mock:                         # 離線確定性偽向量(開發測試用)
