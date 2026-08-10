@@ -444,12 +444,25 @@ class _ElasticsearchParams(_IndexingCommonParams):
     request_timeout: float | None = Field(
         default=None,
         gt=0,
-        description="單次 ES 請求的逾時秒數(client 預設 10)。整批 bulk 寫入"
+        description="單次 ES 請求的逾時秒數(client 預設 10),對寫入用的 "
+        "store 與 settings 預建索引的連線都生效。整批 bulk 寫入"
         "在資料量大或線路慢時會超過 10 秒 —— 症狀是 writer 步驟拋 "
         "'Connection timed out',log 中該次 _bulk 請求是 status:N/A、"
         "duration 恰好等於逾時值。注意:若索引的 refresh_interval 設得很長"
         "(公司 index template 常見 30s / -1),寫入預設會等下一次 refresh,"
-        "此時調高本參數只是讓它願意空等 —— 病因在 refresh_interval",
+        "此時調高本參數只是讓它空等 —— 病因在 refresh_interval",
+    )
+    retry_on_timeout: bool | None = Field(
+        default=None,
+        description="請求逾時是否自動重試(client 預設 false)。線路間歇不穩"
+        "(如 settings 預建索引的 HEAD 偶發 timeout)時設 true;"
+        "連線層錯誤 client 本來就會重試,本參數只擴及逾時",
+    )
+    max_retries: int | None = Field(
+        default=None,
+        ge=1,
+        description="單次請求的最大重試次數(client 預設 3);"
+        "搭配 retry_on_timeout 調整逾時重試的上限",
     )
 
     @model_validator(mode="after")
@@ -489,26 +502,43 @@ def _elasticsearch_auth_kwargs(p: Any) -> dict[str, Any]:
     return {}
 
 
-def _elasticsearch_store_kwargs(p: _ElasticsearchParams) -> dict[str, Any]:
-    """組出 ElasticsearchDocumentStore 的建構參數(選填欄位不設定就不帶)。"""
-    kwargs: dict[str, Any] = {
-        "hosts": p.hosts,
-        "index": p.index,
-        "embedding_similarity_function": "cosine",
-        **_elasticsearch_auth_kwargs(p),
-    }
+def _elasticsearch_client_kwargs(p: _ElasticsearchParams) -> dict[str, Any]:
+    """兩個連線點共用的 elasticsearch client 參數(不設定就不帶)。
+
+    寫入用的 store 與 settings 預建索引的 client 都吃這組:認證、TLS 與
+    timeout / 重試行為必須一致,否則預建路徑會用 client 預設(10 秒、
+    不重試)打第一個請求,調了 request_timeout 也治不到它。
+    """
+    kwargs: dict[str, Any] = {**_elasticsearch_auth_kwargs(p)}
     if p.ca_certs is not None:
         kwargs["ca_certs"] = p.ca_certs
     if p.verify_certs is not None:
         kwargs["verify_certs"] = p.verify_certs
+    if p.request_timeout is not None:
+        kwargs["request_timeout"] = p.request_timeout
+    if p.retry_on_timeout is not None:
+        kwargs["retry_on_timeout"] = p.retry_on_timeout
+    if p.max_retries is not None:
+        kwargs["max_retries"] = p.max_retries
+    return kwargs
+
+
+def _elasticsearch_store_kwargs(p: _ElasticsearchParams) -> dict[str, Any]:
+    """組出 ElasticsearchDocumentStore 的建構參數(選填欄位不設定就不帶)。
+
+    client 參數靠 store 的 **kwargs 原樣轉給 Elasticsearch(...);
+    request_timeout / retry_on_timeout / max_retries 都走這條路。
+    """
+    kwargs: dict[str, Any] = {
+        "hosts": p.hosts,
+        "index": p.index,
+        "embedding_similarity_function": "cosine",
+        **_elasticsearch_client_kwargs(p),
+    }
     if p.custom_mapping is not None:
         kwargs["custom_mapping"] = p.custom_mapping
     if p.ingest_pipeline is not None:
         kwargs["ingest_pipeline"] = p.ingest_pipeline
-    if p.request_timeout is not None:
-        # store 未列名的參數會原樣轉給 elasticsearch client(document_store
-        # 的 **kwargs → Elasticsearch(...)),request_timeout 走這條路。
-        kwargs["request_timeout"] = p.request_timeout
     return kwargs
 
 
@@ -540,12 +570,7 @@ def _build_elasticsearch_store(raw: dict[str, Any], ctx: BuildContext) -> Any:
         # 注意:僅此路徑在建 pipeline 時就連線 ES(預建需要檢查索引存在)。
         from elasticsearch import Elasticsearch
 
-        client_kwargs: dict[str, Any] = {**_elasticsearch_auth_kwargs(p)}
-        if p.ca_certs is not None:
-            client_kwargs["ca_certs"] = p.ca_certs
-        if p.verify_certs is not None:
-            client_kwargs["verify_certs"] = p.verify_certs
-        client = Elasticsearch(p.hosts, **client_kwargs)
+        client = Elasticsearch(p.hosts, **_elasticsearch_client_kwargs(p))
         _ensure_es_index(client, p)
     return ElasticsearchDocumentStore(**kwargs)
 

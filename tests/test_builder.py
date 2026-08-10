@@ -13,6 +13,7 @@ from rag.builder import (
 )
 from rag.components.api_clients import FlexibleAPIRanker
 from rag.methods_ingestion import (
+    _elasticsearch_client_kwargs,
     _ElasticsearchParams,
     _elasticsearch_auth_kwargs,
     _elasticsearch_store_kwargs,
@@ -214,6 +215,57 @@ class TestElasticsearchStoreKwargs:
             hosts="http://localhost:9200", request_timeout=60
         )
         assert _elasticsearch_store_kwargs(params)["request_timeout"] == 60
+
+    def test_retry_params_passed_through(self):
+        params = _ElasticsearchParams(
+            hosts="http://localhost:9200", retry_on_timeout=True, max_retries=5
+        )
+        kwargs = _elasticsearch_store_kwargs(params)
+        assert kwargs["retry_on_timeout"] is True
+        assert kwargs["max_retries"] == 5
+
+    def test_client_kwargs_shared_with_prebuild_path(self):
+        """settings 預建索引的 client 必須拿到與 store 相同的 timeout / 重試
+        設定 —— 否則預建的 HEAD 用 client 預設(10 秒、不重試)打出去,
+        調了 request_timeout 也治不到它。"""
+        params = _ElasticsearchParams(
+            hosts="https://es.example.com:9200",
+            api_key="tok",
+            ca_certs="/certs/ca.crt",
+            request_timeout=60,
+            retry_on_timeout=True,
+            max_retries=5,
+        )
+        assert _elasticsearch_client_kwargs(params) == {
+            "api_key": "tok",
+            "ca_certs": "/certs/ca.crt",
+            "request_timeout": 60,
+            "retry_on_timeout": True,
+            "max_retries": 5,
+        }
+
+    def test_client_kwargs_defaults_stay_empty(self):
+        # 不設定就不帶:交給 elasticsearch client 用自己的預設值。
+        params = _ElasticsearchParams(hosts="http://localhost:9200")
+        assert _elasticsearch_client_kwargs(params) == {}
+
+    def test_max_retries_must_be_at_least_one(self):
+        with pytest.raises(ConfigError, match="max_retries"):
+            build_ingestion_pipeline(
+                parse_config(
+                    make_config(
+                        ingestion={
+                            "indexing": {
+                                "method": "elasticsearch",
+                                "params": {
+                                    "hosts": "http://localhost:9200",
+                                    "max_retries": 0,
+                                },
+                            }
+                        }
+                    )
+                )
+            )
 
     def test_request_timeout_must_be_positive(self):
         with pytest.raises(ConfigError, match="request_timeout"):

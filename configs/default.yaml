@@ -165,12 +165,19 @@ ingestion:
         #                           #   時就會連線 ES 檢查索引是否存在。
         # ingest_pipeline: my-pipeline  # 預設 None:寫入時套用的 ES ingest
         #                           #   pipeline 名稱(伺服器端須已建立)
-        # request_timeout: 60       # 預設 None = client 預設 10 秒。整批 bulk
+        # request_timeout: 60       # 預設 None = client 預設 10 秒;對寫入與
+        #                           #   settings 預建索引的連線都生效。整批 bulk
         #                           #   寫入超過 10 秒時,writer 會拋
         #                           #   "Connection timed out"(log 中該次
         #                           #   _bulk 是 status:N/A、duration 剛好 10s)。
         #                           #   但若索引 refresh_interval 很長(30s/-1),
         #                           #   病因在那裡,調高這裡只是讓它空等。
+        # retry_on_timeout: true    # 預設 None = client 預設 false。逾時自動
+        #                           #   重試;線路間歇不穩(如預建索引的 HEAD
+        #                           #   偶發 timeout)時開啟。連線層錯誤 client
+        #                           #   本來就會重試,本參數只擴及逾時。
+        # max_retries: 3            # 預設 None = client 預設 3:單次請求的
+        #                           #   最大重試次數(搭配 retry_on_timeout)。
 
 inference:
   query_transformation:
