@@ -101,11 +101,19 @@ ingestion:
     # 三個方法都支援 source_field(預設 content):文件端 embedding 改用
     # chunking 生成的 meta 欄位當輸入(如 summary);切片缺該欄位時
     # ingest 直接報錯。查詢端不受影響(查詢文字進同一個模型)。
+    # 也都支援 extra_vectors(預設 None):{向量欄位名: 來源欄位},
+    # 用同一個模型對額外欄位各出一組向量,寫進切片 meta 隨 meta 落入索引
+    # (欄位名不可用框架保留名、不可與既有欄位重名)。ES 上要對額外向量
+    # 做 kNN 須在 custom_mapping 宣告同名 dense_vector 欄位,否則落入
+    # dynamic mapping 變普通 float 陣列;查詢端內建檢索只用主向量
+    # (embedding),額外向量供 custom retrieval 使用。
     method: mock
     method_params:
       mock:                         # 離線確定性偽向量(開發測試用)
         dim: 64                     # 預設 32
         # source_field: content     # 預設 content;可換 chunking 生成的欄位
+        # extra_vectors:            # 預設 None:額外向量(共用同一個模型)
+        #   summary_vector: summary #   {向量欄位名: 來源欄位}
       sentence_transformers:        # 本地模型;需 pip install -e ".[st]"
         model_name: sentence-transformers/all-MiniLM-L6-v2   # 預設值即此
       api_embedding:                # 通用 HTTP API(回應形狀見 README 對映表)

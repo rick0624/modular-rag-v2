@@ -84,6 +84,43 @@ class TestFieldSourceEmbedder:
         embedder = FieldSourceEmbedder(MockDocumentEmbedder(dim=16), "summary")
         assert embedder.run([])["documents"] == []
 
+    def test_extra_vectors_written_to_meta(self):
+        embedder = FieldSourceEmbedder(
+            MockDocumentEmbedder(dim=16),
+            "content",
+            extra_vectors={"summary_vector": "summary"},
+        )
+        doc = self._doc("a::chunk_0", "內容甲", summary="摘要一")
+        out = embedder.run([doc])["documents"][0]
+        assert out.embedding == mock_vector("內容甲", 16)  # 主向量來自 content
+        assert out.meta["summary_vector"] == mock_vector("摘要一", 16)
+        assert out.content == "內容甲" and out.meta["summary"] == "摘要一"
+
+    def test_extra_vectors_combine_with_source_field(self):
+        # 主向量吃 summary、額外向量吃 content:兩者可交叉
+        embedder = FieldSourceEmbedder(
+            MockDocumentEmbedder(dim=16),
+            "summary",
+            extra_vectors={"content_vector": "content"},
+        )
+        doc = self._doc("a::chunk_0", "內容甲", summary="摘要一")
+        out = embedder.run([doc])["documents"][0]
+        assert out.embedding == mock_vector("摘要一", 16)
+        assert out.meta["content_vector"] == mock_vector("內容甲", 16)
+
+    def test_missing_extra_source_fails_with_chunk_id(self):
+        embedder = FieldSourceEmbedder(
+            MockDocumentEmbedder(dim=16),
+            "content",
+            extra_vectors={"summary_vector": "summary"},
+        )
+        doc = self._doc("a::chunk_0", "內容")
+        with pytest.raises(
+            ComponentError, match="extra_vectors 來源欄位 'summary'"
+        ) as excinfo:
+            embedder.run([doc])
+        assert "a::chunk_0" in str(excinfo.value)
+
 
 # ---------------------------------------------------------------------------
 # MetaFieldMapper
@@ -120,6 +157,19 @@ class TestMetaFieldMapper:
         doc = Document(content="內容", meta={"doc_id": "b"})
         out = MetaFieldMapper({"summary_text": "summary"}).run([doc])["documents"][0]
         assert out.meta == {"doc_id": "b"}  # 不塞 None
+
+    def test_preserve_keeps_vector_fields_through_whitelist(self):
+        # extra_vectors 的向量欄位由框架生成,不列白名單也要原名保留
+        doc = Document(
+            content="內容",
+            meta={"doc_id": "a", "summary": "摘要", "summary_vector": [0.1, 0.2]},
+        )
+        out = MetaFieldMapper(
+            {"summary_text": "summary"}, preserve=("summary_vector",)
+        ).run([doc])["documents"][0]
+        assert out.meta["summary_vector"] == [0.1, 0.2]
+        assert out.meta["summary_text"] == "摘要"
+        assert "summary" not in out.meta
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +231,33 @@ class TestChangeFilterSourceField:
         out = f.run([self._current("內容", summary="新")])
         assert out["skipped"] == 1  # 預設只看 content,meta 變化不觸發
 
+    def test_extra_field_change_releases(self):
+        store = self._store_with("內容", summary="舊摘要")
+        f = IncrementalChangeFilter(store, extra_fields=[("summary", "summary")])
+        out = f.run([self._current("內容", summary="新摘要")])
+        assert out["skipped"] == 0 and len(out["documents"]) == 1
+
+    def test_extra_field_unchanged_skips(self):
+        store = self._store_with("內容", summary="摘要")
+        f = IncrementalChangeFilter(store, extra_fields=[("summary", "summary")])
+        out = f.run([self._current("內容", summary="摘要")])
+        assert out["skipped"] == 1 and out["documents"] == []
+
+    def test_extra_field_rename_lookup(self):
+        # store 端的額外來源欄位已被 fields 改名為 summary_text
+        store = self._store_with("內容", summary_text="摘要")
+        f = IncrementalChangeFilter(
+            store, extra_fields=[("summary", "summary_text")]
+        )
+        out = f.run([self._current("內容", summary="摘要")])
+        assert out["skipped"] == 1
+
+    def test_missing_extra_value_releases(self):
+        store = self._store_with("內容")
+        f = IncrementalChangeFilter(store, extra_fields=[("summary", "summary")])
+        out = f.run([self._current("內容")])
+        assert out["skipped"] == 0 and len(out["documents"]) == 1
+
 
 # ---------------------------------------------------------------------------
 # 建構期欄位引用檢查
@@ -193,6 +270,7 @@ def _field_config(
     *,
     provides=("summary", "department"),
     source_field="summary",
+    extra_vectors=None,
     indexing_params=None,
 ):
     chunker = tmp_path / "chunker.py"
@@ -200,6 +278,9 @@ def _field_config(
     chunking_params = {"file": str(chunker), "class": "SummaryChunker"}
     if provides is not None:
         chunking_params["provides_fields"] = list(provides)
+    embedding_params = {"dim": 16, "source_field": source_field}
+    if extra_vectors is not None:
+        embedding_params["extra_vectors"] = extra_vectors
     return parse_config(
         make_config(
             ingestion={
@@ -208,10 +289,7 @@ def _field_config(
                     "params": {"input_dir": str(corpus_dir), "extensions": [".txt"]},
                 },
                 "chunking": {"method": "custom", "params": chunking_params},
-                "embedding": {
-                    "method": "mock",
-                    "params": {"dim": 16, "source_field": source_field},
-                },
+                "embedding": {"method": "mock", "params": embedding_params},
                 "indexing": {
                     "method": "in_memory",
                     "params": dict(indexing_params or {}),
@@ -280,6 +358,69 @@ class TestBuildTimeFieldChecks:
             build_ingestion_pipeline(config)
 
 
+class TestExtraVectorsChecks:
+    def test_reserved_vector_name_rejected(self, tmp_path, corpus_dir):
+        config = _field_config(
+            tmp_path, corpus_dir, extra_vectors={"embedding": "summary"}
+        )
+        with pytest.raises(ConfigError, match="框架保留名"):
+            build_ingestion_pipeline(config)
+
+    def test_duplicate_sources_rejected(self, tmp_path, corpus_dir):
+        config = _field_config(
+            tmp_path, corpus_dir,
+            extra_vectors={"v1": "summary", "v2": "summary"},
+        )
+        with pytest.raises(ConfigError, match="來源欄位不可重複"):
+            build_ingestion_pipeline(config)
+
+    def test_vector_name_colliding_with_source_rejected(self, tmp_path, corpus_dir):
+        config = _field_config(
+            tmp_path, corpus_dir,
+            source_field="content",
+            extra_vectors={"summary": "summary"},  # 向量會覆蓋原文欄位
+        )
+        with pytest.raises(ConfigError, match="與來源欄位重名"):
+            build_ingestion_pipeline(config)
+
+    def test_undeclared_extra_source_rejected(self, tmp_path, corpus_dir):
+        config = _field_config(
+            tmp_path, corpus_dir,
+            extra_vectors={"summary_vector": "sumary"},  # 打錯字
+        )
+        with pytest.raises(
+            ConfigError, match="extra_vectors 來源欄位 'sumary'"
+        ) as excinfo:
+            build_ingestion_pipeline(config)
+        assert "'summary'" in str(excinfo.value)  # 列出可用欄位
+
+    def test_vector_name_colliding_with_declared_field_rejected(
+        self, tmp_path, corpus_dir
+    ):
+        config = _field_config(
+            tmp_path, corpus_dir,
+            source_field="content",
+            extra_vectors={"department": "summary"},  # 撞到 chunker 宣告的欄位
+        )
+        with pytest.raises(ConfigError, match="與.*既有欄位重名"):
+            build_ingestion_pipeline(config)
+
+    def test_incremental_requires_extra_sources_in_whitelist(
+        self, tmp_path, corpus_dir
+    ):
+        config = _field_config(
+            tmp_path, corpus_dir,
+            source_field="content",
+            extra_vectors={"summary_vector": "summary"},
+            indexing_params={
+                "incremental": True,
+                "fields": {"dept": "department"},  # 白名單漏掉 summary
+            },
+        )
+        with pytest.raises(ConfigError, match="fields 白名單必須包含該欄位"):
+            build_ingestion_pipeline(config)
+
+
 # ---------------------------------------------------------------------------
 # 端到端:custom chunker 欄位 → source_field embedding → 白名單 → 增量
 # ---------------------------------------------------------------------------
@@ -327,3 +468,33 @@ def test_field_flow_end_to_end(tmp_path):
     )
     assert changed.embedding == mock_vector("新的摘要", 16)
     assert changed.meta["summary_text"] == "新的摘要"
+
+
+def test_extra_vectors_end_to_end(tmp_path):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "a.txt").write_text("摘要行\n\n甲文件的內文。", encoding="utf-8")
+
+    config = _field_config(
+        tmp_path, raw,
+        source_field="content",
+        extra_vectors={"summary_vector": "summary"},
+        indexing_params={
+            "incremental": True,
+            "fields": {"summary_text": "summary"},  # 額外來源欄位需在白名單
+        },
+    )
+    pipelines = build_pipelines(config, stage="ingestion")
+
+    # 首跑:主向量來自 content,額外向量來自 summary 且不受白名單影響
+    result1 = pipelines.run_ingestion()
+    assert result1["writer"]["documents_written"] == 1
+    doc = pipelines.store.filter_documents()[0]
+    assert doc.embedding == mock_vector(doc.content, 16)
+    assert doc.meta["summary_vector"] == mock_vector("摘要行", 16)
+    assert doc.meta["summary_text"] == "摘要行"
+    assert "summary" not in doc.meta  # 原欄位已依白名單改名
+
+    # 重跑無變更:全跳過,不重寫
+    result2 = pipelines.run_ingestion()
+    assert result2["writer"]["documents_written"] == 0

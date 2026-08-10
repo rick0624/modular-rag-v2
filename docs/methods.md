@@ -24,7 +24,7 @@
 | | `page_based` | 按頁切(需要會產生頁界的 parser:pdf / auto) |
 | | `no_chunking` | 整份文件一個切片 |
 | | `custom` | 自訂切塊規則;可生成自訂 meta 欄位並以 `provides_fields` 宣告 |
-| 4 Embedding(皆支援 `source_field`:改用 chunking 生成的欄位做向量) | `mock` | 離線確定性偽向量(開發測試用) |
+| 4 Embedding(皆支援 `source_field`:改用 chunking 生成的欄位做向量;與 `extra_vectors`:同一模型對額外欄位各出一組向量,寫進 meta 隨索引落地) | `mock` | 離線確定性偽向量(開發測試用) |
 | | `sentence_transformers` | 本地模型 🔌 `[st]` |
 | | `api_embedding` | 通用 HTTP embedding API(欄位名可對映,OpenAI 式也用它) |
 | 5 Indexing(皆支援 `fields:` 自訂欄位白名單/改名) | `in_memory` | 記憶體索引(隨 process 消失;開發測試用) |

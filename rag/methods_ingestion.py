@@ -264,23 +264,65 @@ def _build_no_chunking(raw: dict[str, Any], ctx: BuildContext) -> None:
 
 
 class _EmbeddingCommonParams(BaseParams):
-    """所有 embedding 方法共用:選哪個欄位當文件端 embedding 輸入。"""
+    """所有 embedding 方法共用:選哪個(些)欄位當文件端 embedding 輸入。"""
 
     source_field: str = Field(
         default="content",
         description="文件端 embedding 的輸入欄位:content(預設)或 chunking "
         "生成的任一 meta 欄位;查詢端不受影響(查詢文字進同一個模型)",
     )
+    extra_vectors: dict[str, str] | None = Field(
+        default=None,
+        description="額外向量(共用同一個模型):{向量欄位名: 來源欄位}。"
+        "主向量照舊寫進 embedding;每組額外向量以指定名字寫進切片 meta,"
+        "隨 meta 落入索引(ES 的 kNN 需在 custom_mapping 宣告同名 "
+        "dense_vector 欄位)。查詢端內建檢索只用主向量,額外向量供 "
+        "custom retrieval 使用",
+    )
+
+    @model_validator(mode="after")
+    def _validate_extra_vectors(self) -> "_EmbeddingCommonParams":
+        if self.extra_vectors is None:
+            return self
+        bad_names = sorted(set(self.extra_vectors) & _RESERVED_FIELD_NAMES)
+        if bad_names:
+            raise ValueError(
+                f"extra_vectors 的向量欄位名不可使用框架保留名 {bad_names}"
+                "(主向量固定寫在 embedding,不需列出)"
+            )
+        sources = list(self.extra_vectors.values())
+        if len(set(sources)) != len(sources):
+            raise ValueError(
+                "extra_vectors 的來源欄位不可重複"
+                "(共用同一個模型時,同一來源只會得到相同向量)"
+            )
+        collisions = sorted(
+            set(self.extra_vectors) & ({self.source_field} | set(sources))
+        )
+        if collisions:
+            raise ValueError(
+                f"extra_vectors 的向量欄位名 {collisions} 與來源欄位重名,"
+                "向量會覆蓋 meta 中的原文欄位"
+            )
+        if any(not k.strip() for k in self.extra_vectors) or any(
+            not v.strip() for v in sources
+        ):
+            raise ValueError("extra_vectors 的鍵與值不可為空字串")
+        return self
 
 
-def _wrap_source_field(doc_embedder: Any, source_field: str) -> Any:
-    """source_field 非 content 時把文件端 embedder 包進 FieldSourceEmbedder。
+def _wrap_source_field(
+    doc_embedder: Any,
+    source_field: str,
+    extra_vectors: dict[str, str] | None = None,
+) -> Any:
+    """輸入來源非預設時把文件端 embedder 包進 FieldSourceEmbedder。
 
     只在非預設時包:元件名照舊是 "embedder",預設路徑的圖形狀完全不變。
     """
-    if source_field == "content":
+    if source_field == "content" and not extra_vectors:
         return doc_embedder
-    return FieldSourceEmbedder(doc_embedder, source_field)
+    return FieldSourceEmbedder(doc_embedder, source_field, extra_vectors)
 
 
 class _MockEmbeddingParams(_EmbeddingCommonParams):
@@ -290,7 +332,9 @@ class _MockEmbeddingParams(_EmbeddingCommonParams):
 def _build_mock_embedding(raw: dict[str, Any], ctx: BuildContext) -> tuple[Any, Any]:
     p = validate_params("embedding", "mock", _MockEmbeddingParams, raw)
     return (
-        _wrap_source_field(MockDocumentEmbedder(dim=p.dim), p.source_field),
+        _wrap_source_field(
+            MockDocumentEmbedder(dim=p.dim), p.source_field, p.extra_vectors
+        ),
         MockTextEmbedder(dim=p.dim),
     )
 
@@ -310,9 +354,13 @@ class _ApiEmbeddingParams(_EmbeddingCommonParams):
 def _build_api_embedding(raw: dict[str, Any], ctx: BuildContext) -> tuple[Any, Any]:
     p = validate_params("embedding", "api_embedding", _ApiEmbeddingParams, raw)
     kwargs = p.model_dump()
-    kwargs.pop("source_field")  # 框架參數,不透傳給 API 元件的建構子
+    # 框架參數,不透傳給 API 元件的建構子
+    kwargs.pop("source_field")
+    kwargs.pop("extra_vectors")
     return (
-        _wrap_source_field(FlexibleAPIDocumentEmbedder(**kwargs), p.source_field),
+        _wrap_source_field(
+            FlexibleAPIDocumentEmbedder(**kwargs), p.source_field, p.extra_vectors
+        ),
         FlexibleAPITextEmbedder(**kwargs),
     )
 
@@ -341,7 +389,9 @@ def _build_sentence_transformers(
         ) from exc
     return (
         _wrap_source_field(
-            SentenceTransformersDocumentEmbedder(model=p.model_name), p.source_field
+            SentenceTransformersDocumentEmbedder(model=p.model_name),
+            p.source_field,
+            p.extra_vectors,
         ),
         SentenceTransformersTextEmbedder(model=p.model_name),
     )
