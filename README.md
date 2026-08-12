@@ -29,9 +29,9 @@ Evaluation: JSONL 測試集 → 逐題查詢 → hit rate / MRR
 | chunking | **fixed_size** / structure_based / page_based / no_chunking / custom | (Recursive)DocumentSplitter,一律字元單位 / 自訂元件(公司切塊規則) |
 | embedding | **mock** / sentence_transformers / api_embedding;皆支援 `source_field`(選任一 chunking 生成欄位做向量)與 `extra_vectors`(同一模型對額外欄位各出一組向量) | ST 整合套件 / 自訂 Flexible API embedder |
 | indexing | **in_memory** / elasticsearch(皆支援 `incremental: true` 增量 ingest 與 `fields:` 欄位白名單/改名;ES 另支援 custom_mapping + settings 預建索引) | InMemory / Elasticsearch DocumentStore |
-| query_transformation | **normalize** / passthrough / glossary / jargon_mapping / llm_rewrite / llm_decompose / custom | 自訂元件(`list[str] → list[str]`) |
+| query_transformation | **normalize** / passthrough / glossary / jargon_mapping / llm_rewrite / llm_decompose / llm_multi_hyde / preqrag / custom | 自訂元件(`list[str] → list[str]`) |
 | retrieval | **bm25** / embedding / hybrid(皆支援 `boost_k_factor` 候選放大) / custom | 依 indexing 選 retriever;hybrid 走 RRF |
-| reranking | **none** / similarity / api_rerank / llm / llm_fact_check / custom | ST cross-encoder / 自訂 Flexible API ranker / core LLMRanker / 自訂 LLMFactChecker |
+| reranking | **none** / similarity / api_rerank / llm / insertrank / llm_fact_check / custom | ST cross-encoder / 自訂 Flexible API ranker / core LLMRanker / 自訂 InsertRankLLMRanker / 自訂 LLMFactChecker |
 | generation | **mock** / openai / gateway_openai_compatible / custom(`generate_answer: false` 可跳過) | OpenAIChatGenerator / 自訂閘道 generator / 自訂元件(`messages → replies`) |
 | routing(選填槽位,省略=不做) | keyword_match / custom | 自訂 KeywordRouteClassifier;結果進 `query()` 的 `routing` key,不影響檢索 |
 | formatter(選填槽位,省略=不做) | simple_json / custom | 終端支線:最終結果組成對外格式,進 `query()` 的 `output` key;canonical 鍵照舊 |
@@ -472,9 +472,9 @@ class BySentenceSplitter:
 - **generation 的 custom 是「換掉 LLM 客戶端」,不是換掉 prompt 組裝**:
   契約就是 Haystack 的 ChatGenerator 形狀,`prompt_template` /
   `system_prompt` 照常寫在 YAML,元件收到的是框架組好的 messages。
-  同一支元件也能掛在 `llm_rewrite` / `llm_decompose` / `llm` /
-  `llm_fact_check` 的 `params.generator`,整條 pipeline 只走公司的推論
-  服務。OpenAI 相容的閘道**不需要**寫 custom,用
+  同一支元件也能掛在 `llm_rewrite` / `llm_decompose` / `llm_multi_hyde` /
+  `preqrag` / `llm` / `insertrank` / `llm_fact_check` 的
+  `params.generator`,整條 pipeline 只走公司的推論服務。OpenAI 相容的閘道**不需要**寫 custom,用
   `gateway_openai_compatible` 即可。
 - **fusion 掛了 custom 就一律執行**:單一查詢(N=1)也進元件,「單查詢
   原樣通過」的內建行為不會幫你做,由元件自己決定。建議額外輸出
@@ -587,9 +587,10 @@ TRANSFORM_FACTORIES["by_sentence"] = SlotFactory(build=_build_by_sentence)
   `model` 未設定時請求**完全不帶**該欄位(官方 SDK 做不到);
   OpenAI 推理模型(gpt-5 / o 系列)自動忽略 `temperature`、
   改以 `max_completion_tokens` 送出,不需調整 YAML。
-- `llm_decompose`、`llm_rewrite`、`llm` 重排與 `llm_fact_check` 未指定
-  `generator` 時,**沿用 generation 槽位的 LLM 設定**(各自新實例);
-  也可各自指定(smoke.yaml 用 mock 腳本示範)。
+- `llm_decompose`、`llm_rewrite`、`llm_multi_hyde`、`preqrag`、`llm` 重排、
+  `insertrank` 與 `llm_fact_check` 未指定 `generator` 時,**沿用 generation
+  槽位的 LLM 設定**(各自新實例);也可各自指定(smoke.yaml 用 mock
+  腳本示範)。
 
 ## 檢索-only 模式(`generate_answer: false`)
 

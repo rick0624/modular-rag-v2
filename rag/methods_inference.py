@@ -19,13 +19,19 @@ from pydantic import Field
 from rag.components.api_clients import FlexibleAPIRanker
 from rag.components.fact_check import DEFAULT_FACT_CHECK_PROMPT, LLMFactChecker
 from rag.components.gateway_generator import GatewayChatGenerator, MockChatGenerator
+from rag.components.llm_rerankers import DEFAULT_INSERTRANK_PROMPT, InsertRankLLMRanker
 from rag.components.query_transforms import (
     DEFAULT_DECOMPOSE_PROMPT,
+    DEFAULT_MULTI_HYDE_PROMPT,
+    DEFAULT_PREQRAG_CLASSIFY_PROMPT,
+    DEFAULT_PREQRAG_REWRITE_PROMPT,
     DEFAULT_REWRITE_PROMPT,
     GlossaryExpander,
     JargonMapper,
+    LLMMultiHyDEExpander,
     LLMQueryDecomposer,
     LLMQueryRewriter,
+    PreQRAGDispatcher,
     QueryNormalizer,
 )
 from rag.components.side_branches import KeywordRouteClassifier, SimpleJsonFormatter
@@ -349,6 +355,78 @@ def _build_llm_rewrite(raw: dict[str, Any], ctx: BuildContext) -> Any:
     return LLMQueryRewriter(chat_generator=chat_generator, prompt=p.prompt)
 
 
+class _MultiHyDEParams(BaseParams):
+    num_documents: int = Field(default=3, ge=1, description="假設文件篇數")
+    keep_original: bool = Field(
+        default=True,
+        description="是否保留原查詢(原查詢 + 假設文件各自檢索後融合);"
+        "false = 只用假設文件檢索",
+    )
+    prompt: str = Field(
+        default=DEFAULT_MULTI_HYDE_PROMPT,
+        description="假設文件 prompt(含 {{ query }} 與 {num_documents})",
+    )
+    generator: dict[str, Any] | None = Field(
+        default=None,
+        description="生成用的 chat generator({method, params});"
+        "未設定時沿用 generation 槽位",
+    )
+
+
+def _build_llm_multi_hyde(raw: dict[str, Any], ctx: BuildContext) -> Any:
+    p = validate_params("query_transformation", "llm_multi_hyde", _MultiHyDEParams, raw)
+    chat_generator = _chat_generator_from_block(
+        "query_transformation 方法 'llm_multi_hyde'", p.generator, ctx
+    )
+    return LLMMultiHyDEExpander(
+        chat_generator=chat_generator,
+        prompt=p.prompt,
+        num_documents=p.num_documents,
+        keep_original=p.keep_original,
+    )
+
+
+class _PreQRAGParams(BaseParams):
+    num_rewrites: int = Field(default=2, gt=0, description="single 分支的改寫條數")
+    max_subqueries: int = Field(default=4, gt=1, description="multi 分支的子查詢數上限")
+    include_original: bool = Field(
+        default=True, description="是否保留原查詢(與改寫/子查詢各自檢索後融合)"
+    )
+    classify_prompt: str = Field(
+        default=DEFAULT_PREQRAG_CLASSIFY_PROMPT,
+        description="分類 prompt(含 {{ query }})",
+    )
+    rewrite_prompt: str = Field(
+        default=DEFAULT_PREQRAG_REWRITE_PROMPT,
+        description="改寫 prompt(含 {{ query }} 與 {num_rewrites})",
+    )
+    decompose_prompt: str = Field(
+        default=DEFAULT_DECOMPOSE_PROMPT,
+        description="拆解 prompt(含 {{ query }} 與 {max_subqueries})",
+    )
+    generator: dict[str, Any] | None = Field(
+        default=None,
+        description="分類/改寫/拆解共用的 chat generator({method, params});"
+        "未設定時沿用 generation 槽位",
+    )
+
+
+def _build_preqrag(raw: dict[str, Any], ctx: BuildContext) -> Any:
+    p = validate_params("query_transformation", "preqrag", _PreQRAGParams, raw)
+    chat_generator = _chat_generator_from_block(
+        "query_transformation 方法 'preqrag'", p.generator, ctx
+    )
+    return PreQRAGDispatcher(
+        chat_generator=chat_generator,
+        classify_prompt=p.classify_prompt,
+        rewrite_prompt=p.rewrite_prompt,
+        decompose_prompt=p.decompose_prompt,
+        num_rewrites=p.num_rewrites,
+        max_subqueries=p.max_subqueries,
+        include_original=p.include_original,
+    )
+
+
 class _PassthroughParams(BaseParams):
     pass
 
@@ -370,6 +448,8 @@ TRANSFORM_FACTORIES: dict[str, SlotFactory] = {
     "jargon_mapping": SlotFactory(build=_build_jargon_mapping),
     "llm_rewrite": SlotFactory(build=_build_llm_rewrite),
     "llm_decompose": SlotFactory(build=_build_llm_decompose),
+    "llm_multi_hyde": SlotFactory(build=_build_llm_multi_hyde),
+    "preqrag": SlotFactory(build=_build_preqrag),
     "custom": SlotFactory(build=_build_custom_transform),
 }
 
@@ -441,6 +521,37 @@ def _build_llm_fact_check(raw: dict[str, Any], ctx: BuildContext) -> Any:
     )
 
 
+class _InsertRankParams(BaseParams):
+    top_k: int = Field(default=5, gt=0)
+    score_label: str = Field(
+        default="檢索分數",
+        description="prompt 中分數的名稱;依上游檢索器據實描述"
+        "(如 BM25 分數、RRF 融合分數)",
+    )
+    prompt: str = Field(
+        default=DEFAULT_INSERTRANK_PROMPT,
+        description="重排 prompt(含 {{ query }}、{{ documents }} 與 {score_label})",
+    )
+    generator: dict[str, Any] | None = Field(
+        default=None,
+        description="重排用的 chat generator({method, params});"
+        "未設定時沿用 generation 槽位",
+    )
+
+
+def _build_insertrank(raw: dict[str, Any], ctx: BuildContext) -> Any:
+    p = validate_params("reranking", "insertrank", _InsertRankParams, raw)
+    chat_generator = _chat_generator_from_block(
+        "reranking 方法 'insertrank'", p.generator, ctx
+    )
+    return InsertRankLLMRanker(
+        chat_generator=chat_generator,
+        prompt=p.prompt,
+        top_k=p.top_k,
+        score_label=p.score_label,
+    )
+
+
 class _APIRerankParams(BaseParams):
     endpoint: str = Field(description="rerank API 端點(完整 URL)")
     headers: dict[str, str] = Field(
@@ -498,6 +609,7 @@ RERANKING_FACTORIES: dict[str, SlotFactory] = {
     "similarity": SlotFactory(build=_build_similarity_ranker),
     "api_rerank": SlotFactory(build=_build_api_ranker),
     "llm": SlotFactory(build=_build_llm_ranker),
+    "insertrank": SlotFactory(build=_build_insertrank),
     "llm_fact_check": SlotFactory(build=_build_llm_fact_check),
     "custom": SlotFactory(build=_build_custom_reranker),
 }

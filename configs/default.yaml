@@ -192,7 +192,7 @@ ingestion:
 inference:
   query_transformation:
     # 可選:passthrough / normalize / glossary / jargon_mapping /
-    #      llm_rewrite / llm_decompose / custom
+    #      llm_rewrite / llm_decompose / llm_multi_hyde / preqrag / custom
     # 鏈(list[str] → list[str],可串接):[normalize, llm_decompose]
     #                                 或 [jargon_mapping, llm_rewrite]
     method: normalize
@@ -218,6 +218,19 @@ inference:
       llm_decompose:                # LLM 查詢拆解(1 → N 子查詢)
         max_subqueries: 3           # 預設 4
         # prompt: |                 # 預設:內建拆解 prompt(需含 {{ query }})
+        # generator: {...}          # 預設 None = 沿用 generation 槽位
+      llm_multi_hyde:               # Multi-HyDE:LLM 生成 k 篇多角度假設文件
+        # num_documents: 3          # 預設 3:假設文件篇數
+        # keep_original: true       # 預設 true:原查詢 + 假設文件各自檢索後融合
+        # prompt: |                 # 預設:內建假設文件 prompt(需含 {{ query }})
+        # generator: {...}          # 預設 None = 沿用 generation 槽位
+      preqrag:                      # PreQRAG:先分類 single/multi 再改寫或拆解
+        # num_rewrites: 2           # 預設 2:single 分支的改寫條數
+        # max_subqueries: 4         # 預設 4:multi 分支的子查詢數上限
+        # include_original: true    # 預設 true:原查詢也保留一路
+        # classify_prompt: |        # 預設:內建分類 prompt(需含 {{ query }})
+        # rewrite_prompt: |         # 預設:內建改寫 prompt(需含 {{ query }})
+        # decompose_prompt: |       # 預設:內建拆解 prompt(需含 {{ query }})
         # generator: {...}          # 預設 None = 沿用 generation 槽位
       custom:                       # 自訂元件(Haystack @component .py 檔)
         # 契約:queries: list[str] → queries: list[str](詳見 README
@@ -247,7 +260,8 @@ inference:
         # init_params: {top_k: 5}   # 預設 {}
 
   reranking:
-    # 可選:none / similarity / api_rerank / llm / llm_fact_check / custom
+    # 可選:none / similarity / api_rerank / llm / insertrank /
+    #      llm_fact_check / custom
     # 鏈(可串接):[similarity, llm] 或 [api_rerank, llm_fact_check]
     method: none
     method_params:
@@ -280,6 +294,14 @@ inference:
         #                           # 直接炸出來,確認欄位對映無誤
       llm:                          # LLM listwise 重排
         top_k: 5                    # 預設 5
+        # generator: {...}          # 預設 None = 沿用 generation 槽位
+      insertrank:                   # InsertRank:候選附檢索分數的 listwise 重排
+        # top_k: 5                  # 預設 5
+        # score_label: 檢索分數      # prompt 中分數的名稱,依上游據實描述
+        #                           # (bm25 檢索最忠實於論文;hybrid 經 RRF
+        #                           # 融合後分數量級不同)
+        # prompt: |                 # 預設:內建重排 prompt
+        #                           # (需含 {{ query }} 與 {{ documents }})
         # generator: {...}          # 預設 None = 沿用 generation 槽位
       llm_fact_check:               # LLM 相關性查核:**只過濾**,不重排不改分
         # prompt: |                 # 預設:內建查核 prompt

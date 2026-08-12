@@ -1,5 +1,5 @@
 """Query transformation 元件測試:normalize / glossary / jargon_mapping /
-llm_rewrite / llm_decompose。"""
+llm_rewrite / llm_decompose / llm_multi_hyde / preqrag。"""
 
 from __future__ import annotations
 
@@ -11,11 +11,18 @@ from rag.components.gateway_generator import MockChatGenerator
 from rag.components.query_transforms import (
     GlossaryExpander,
     JargonMapper,
+    LLMMultiHyDEExpander,
     LLMQueryDecomposer,
     LLMQueryRewriter,
+    PreQRAGDispatcher,
     QueryNormalizer,
 )
 from rag.errors import ComponentError
+
+
+class BrokenGenerator:
+    def run(self, messages):
+        raise RuntimeError("LLM 掛了")
 
 
 class TestNormalizer:
@@ -226,3 +233,114 @@ class TestDecomposer:
         generator = MockChatGenerator(replies=["1. a1\n2. a2", "1. b1"])
         decomposer = LLMQueryDecomposer(chat_generator=generator)
         assert decomposer.run(queries=["qa", "qb"])["queries"] == ["a1", "a2", "b1"]
+
+
+class TestMultiHyDE:
+    def test_original_plus_hypothetical_documents(self):
+        generator = MockChatGenerator(
+            replies=['{"documents": ["RRF 的定義是…", "RRF 的計算步驟是…"]}']
+        )
+        expander = LLMMultiHyDEExpander(chat_generator=generator)
+        out = expander.run(queries=["RRF 是什麼?"])
+        assert out["queries"] == ["RRF 是什麼?", "RRF 的定義是…", "RRF 的計算步驟是…"]
+
+    def test_keep_original_off(self):
+        generator = MockChatGenerator(replies=['{"documents": ["假設文件"]}'])
+        expander = LLMMultiHyDEExpander(chat_generator=generator, keep_original=False)
+        assert expander.run(queries=["原查詢"])["queries"] == ["假設文件"]
+
+    def test_num_documents_caps_output(self):
+        generator = MockChatGenerator(replies=['{"documents": ["a", "b", "c"]}'])
+        expander = LLMMultiHyDEExpander(chat_generator=generator, num_documents=2)
+        assert expander.run(queries=["q"])["queries"] == ["q", "a", "b"]
+
+    def test_invalid_items_skipped(self):
+        # 空字串與非字串項不算有效篇,部分成功用部分
+        generator = MockChatGenerator(replies=['{"documents": ["", 42, " 有效 "]}'])
+        expander = LLMMultiHyDEExpander(chat_generator=generator)
+        assert expander.run(queries=["q"])["queries"] == ["q", "有效"]
+
+    def test_garbage_reply_fails_soft(self, caplog):
+        generator = MockChatGenerator(replies=["這不是 JSON"])
+        expander = LLMMultiHyDEExpander(chat_generator=generator, keep_original=False)
+        with caplog.at_level("WARNING"):
+            out = expander.run(queries=["原查詢"])
+        assert out["queries"] == ["原查詢"]
+        assert "Multi-HyDE" in caplog.text
+
+    def test_generator_exception_fails_soft(self):
+        expander = LLMMultiHyDEExpander(chat_generator=BrokenGenerator())
+        assert expander.run(queries=["原查詢"])["queries"] == ["原查詢"]
+
+    def test_each_query_expanded_in_order(self):
+        generator = MockChatGenerator(
+            replies=['{"documents": ["假設 A"]}', '{"documents": ["假設 B"]}']
+        )
+        expander = LLMMultiHyDEExpander(chat_generator=generator)
+        out = expander.run(queries=["qa", "qb"])
+        assert out["queries"] == ["qa", "假設 A", "qb", "假設 B"]
+
+
+class TestPreQRAG:
+    def test_single_question_gets_rewrites(self):
+        # 腳本:第 1 次呼叫 = 分類,第 2 次 = 改寫
+        generator = MockChatGenerator(
+            replies=[
+                '{"type": "single"}',
+                '{"rewrites": ["FAISS 支援的索引結構", "FAISS 索引種類"]}',
+            ]
+        )
+        dispatcher = PreQRAGDispatcher(chat_generator=generator)
+        out = dispatcher.run(queries=["FAISS 支援哪些索引?"])
+        assert out["queries"] == [
+            "FAISS 支援哪些索引?",
+            "FAISS 支援的索引結構",
+            "FAISS 索引種類",
+        ]
+
+    def test_multi_question_gets_decomposed(self):
+        # 腳本:第 1 次呼叫 = 分類,第 2 次 = 拆解(行式輸出)
+        generator = MockChatGenerator(
+            replies=['{"type": "multi"}', "1. FAISS 的優點?\n2. ES 的優點?"]
+        )
+        dispatcher = PreQRAGDispatcher(chat_generator=generator)
+        out = dispatcher.run(queries=["FAISS 和 ES 有什麼差別?"])
+        assert out["queries"] == [
+            "FAISS 和 ES 有什麼差別?",
+            "FAISS 的優點?",
+            "ES 的優點?",
+        ]
+
+    def test_unparsable_classification_defaults_to_single(self, caplog):
+        generator = MockChatGenerator(
+            replies=["這不是 JSON", '{"rewrites": ["改寫一"]}']
+        )
+        dispatcher = PreQRAGDispatcher(chat_generator=generator)
+        with caplog.at_level("WARNING"):
+            out = dispatcher.run(queries=["原查詢"])
+        assert out["queries"] == ["原查詢", "改寫一"]
+        assert "視為 single" in caplog.text
+
+    def test_include_original_off(self):
+        generator = MockChatGenerator(
+            replies=['{"type": "single"}', '{"rewrites": ["改寫一"]}']
+        )
+        dispatcher = PreQRAGDispatcher(chat_generator=generator, include_original=False)
+        assert dispatcher.run(queries=["原查詢"])["queries"] == ["改寫一"]
+
+    def test_rewrite_failure_falls_back_to_original(self):
+        # 分類成功但改寫壞掉:退回原查詢,且不因 include_original 而重複
+        generator = MockChatGenerator(replies=['{"type": "single"}', "這不是 JSON"])
+        dispatcher = PreQRAGDispatcher(chat_generator=generator)
+        assert dispatcher.run(queries=["原查詢"])["queries"] == ["原查詢"]
+
+    def test_generator_exception_fails_soft(self):
+        dispatcher = PreQRAGDispatcher(chat_generator=BrokenGenerator())
+        assert dispatcher.run(queries=["原查詢"])["queries"] == ["原查詢"]
+
+    def test_num_rewrites_caps_output(self):
+        generator = MockChatGenerator(
+            replies=['{"type": "single"}', '{"rewrites": ["a", "b", "c"]}']
+        )
+        dispatcher = PreQRAGDispatcher(chat_generator=generator, num_rewrites=2)
+        assert dispatcher.run(queries=["q"])["queries"] == ["q", "a", "b"]
