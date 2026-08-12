@@ -40,6 +40,8 @@
 | | `jargon_mapping` | 術語替換查詢文字(適合檢索-only) |
 | | `llm_rewrite` | LLM 查詢改寫(1 → 1) |
 | | `llm_decompose` | LLM 查詢拆解(1 → N 子查詢,子查詢各自檢索後融合) |
+| | `llm_multi_hyde` | Multi-HyDE:LLM 生成 k 篇多角度假設文件參與檢索(對向量檢索特別有效) |
+| | `preqrag` | PreQRAG:先分類 single/multi,單文件問題改寫、跨文件問題拆解(SIGIR 2025 LiveRAG) |
 | | `custom` | 自訂轉換 |
 | 7 Retrieval | `bm25` | 關鍵字檢索 |
 | | `embedding` | 向量檢索 |
@@ -49,6 +51,7 @@
 | | `similarity` | cross-encoder 相似度重排 🔌 `[st]` |
 | | `api_rerank` | 通用 HTTP rerank API(欄位名可對映) |
 | | `llm` | LLM listwise 重排 |
+| | `insertrank` | InsertRank:listwise 重排時把候選的檢索分數寫進 prompt(WSDM 2026;只重排不改分) |
 | | `llm_fact_check` | LLM 相關性查核(只過濾,不重排不改分) |
 | | `custom` | 自訂重排 |
 | 融合/聚合(內建步驟) | (內建) | `strategy: rrf / concat_dedup / max_score` × `group_by: none / doc / page`;內建融合直接寫扁平參數、**不寫 method** |
@@ -75,8 +78,9 @@
   契約見 interfaces.md §1;範例骨架在 `examples/custom_modules/`,
   完整掛載示範見 `configs/custom_demo.yaml`(inference 端)與
   `configs/custom_ingestion_demo.yaml`(ingestion 端)。
-- **LLM 類方法**(`llm_rewrite` / `llm_decompose` / `llm` /
-  `llm_fact_check`)都有 `generator` 參數可各自指定 LLM
+- **LLM 類方法**(`llm_rewrite` / `llm_decompose` / `llm_multi_hyde` /
+  `preqrag` / `llm` / `insertrank` / `llm_fact_check`)都有 `generator`
+  參數可各自指定 LLM
   (`{method, params}`,吃 Generation 模組的任一方法);
   不設定時沿用 generation 槽位 —— 整條管線因此可以只接一個 LLM 來源。
 - **新增方法**:通用功能寫元件 + 在 `methods_ingestion.py` /

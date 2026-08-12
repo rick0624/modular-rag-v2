@@ -496,6 +496,67 @@ class TestFactCheckRegistration:
         assert isinstance(inner.get_component("ranker_2"), LLMFactChecker)
 
 
+class TestResearchMethodRegistration:
+    """preqrag / llm_multi_hyde / insertrank 走完整的 config → pipeline
+    路徑(元件行為見 test_query_transforms / test_llm_rerankers)。"""
+
+    def test_preqrag_built_with_params(self):
+        from rag.components.query_transforms import PreQRAGDispatcher
+
+        config = parse_config(
+            make_config(
+                inference={
+                    "query_transformation": {
+                        "method": "preqrag",
+                        "params": {"num_rewrites": 3, "include_original": False},
+                    }
+                }
+            )
+        )
+        pipeline, _ = build_inference_pipeline(config)
+        dispatcher = pipeline.get_component("transform")
+        assert isinstance(dispatcher, PreQRAGDispatcher)
+        assert dispatcher.num_rewrites == 3
+        assert dispatcher.include_original is False
+
+    def test_multi_hyde_built_with_params(self):
+        from rag.components.query_transforms import LLMMultiHyDEExpander
+
+        config = parse_config(
+            make_config(
+                inference={
+                    "query_transformation": {
+                        "method": "llm_multi_hyde",
+                        "params": {"num_documents": 2, "keep_original": False},
+                    }
+                }
+            )
+        )
+        pipeline, _ = build_inference_pipeline(config)
+        expander = pipeline.get_component("transform")
+        assert isinstance(expander, LLMMultiHyDEExpander)
+        assert expander.num_documents == 2
+        assert expander.keep_original is False
+
+    def test_insertrank_built_with_params(self):
+        from rag.components.llm_rerankers import InsertRankLLMRanker
+
+        config = parse_config(
+            make_config(
+                inference={
+                    "reranking": {
+                        "method": "insertrank",
+                        "params": {"top_k": 3, "score_label": "BM25 分數"},
+                    }
+                }
+            )
+        )
+        pipeline, _ = build_inference_pipeline(config)
+        ranker = pipeline.get_component("multi_query").inner.get_component("ranker")
+        assert isinstance(ranker, InsertRankLLMRanker)
+        assert (ranker.top_k, ranker.score_label) == (3, "BM25 分數")
+
+
 class TestSkipGeneration:
     def test_missing_generation_with_default_flag_rejected(self):
         data = make_config()
