@@ -15,6 +15,9 @@
 每筆 record 都帶出處:label(人讀的組合名)、overrides(這個組合改了
 哪些槽位)、config(完整 config dict,可存檔重現)。評估邏輯不在此
 腳本內 —— 拿 records 之後自己接。
+
+需要多個槽位綁定一起換(例如 embedding 模型與 custom retrieval 必須
+一致)時,用 bundle 選項 —— 見 SLOT_OPTIONS 的說明。
 """
 
 from __future__ import annotations
@@ -44,12 +47,24 @@ BASE_CONFIG = "configs/default.yaml"
 #            2-3 個有交互作用的槽位後用 product,不需要第三種模式。
 MODE = "one_at_a_time"
 
-# 槽位 → 要比較的選項清單。選項的三種寫法:
+# 槽位 → 要比較的選項清單。選項的四種寫法:
 #   字串   → 只覆蓋 method,參數沿用 default.yaml 的 method_params 型錄
 #   list  → 方法鏈(如 ["normalize", "llm_decompose"])
 #   dict  → 整個槽位配置直接替換(要自訂參數、或 fusion / routing 這類
 #           基底沒啟用的槽位時用),如:
 #           {"method": "llm", "params": {"top_k": 3}}
+#   bundle → key 含「.」的 dict:一次覆蓋多個槽位,綁定一起換(例如
+#           ingestion 的 embedding 模型跟 custom retrieval 用的模型必須
+#           一致、或 retriever / fusion / formatter 要當一組 preset 時)。
+#           此時外層 key 只是維度名(自取,不必是槽位路徑),product 模式
+#           下整組作為一個維度參與交叉;"_label" 選填,當這個選項的名字:
+#           "embedding_stack": [
+#               {"_label": "openai-small",
+#                "ingestion.embedding": {"method": "api_embedding", "params": {...}},
+#                "inference.retrieval": {"method": "custom", "params": {...}}},
+#               {"_label": "minilm-local", ...},
+#           ]
+#           同一個槽位只能屬於一個維度(重疊時 make_variants 直接報錯)。
 SLOT_OPTIONS: dict[str, list[Any]] = {
     "inference.retrieval": ["bm25", "embedding", "hybrid"],
     "inference.query_transformation": ["passthrough", "normalize"],
@@ -72,8 +87,55 @@ def apply_option(cfg: dict, dotted_slot: str, option: Any) -> None:
         cfg[section].setdefault(slot, {})["method"] = option
 
 
+def is_bundle(option: Any) -> bool:
+    """bundle 選項 = key 含「.」的 dict(一次覆蓋多個槽位)。
+
+    不會與「整個槽位配置」的 dict 寫法混淆:後者的 key 是 method /
+    params 等欄位名,不含「.」。
+    """
+    return isinstance(option, dict) and any("." in key for key in option)
+
+
+def resolve_overrides(dim: str, option: Any) -> dict[str, Any]:
+    """把一個選項展成 {dotted_slot: 選項} 的覆蓋表。"""
+    if is_bundle(option):
+        return {k: v for k, v in option.items() if k != "_label"}
+    if "." not in dim:
+        raise ValueError(
+            f"維度 {dim!r} 不是槽位路徑(缺少「.」),它的選項必須是 bundle"
+            f"(key 含「.」的 dict),但得到:{option!r}"
+        )
+    return {dim: option}
+
+
+def check_dimensions() -> None:
+    """同一個槽位只能屬於一個維度,否則後套用的會安靜地蓋掉先套用的。"""
+    owner: dict[str, str] = {}  # dotted_slot → 首見的維度名
+    for dim, options in SLOT_OPTIONS.items():
+        for opt in options:
+            for slot in resolve_overrides(dim, opt):
+                if owner.setdefault(slot, dim) != dim:
+                    raise ValueError(
+                        f"維度 {owner[slot]!r} 與 {dim!r} 都覆蓋槽位 {slot!r},"
+                        "請把重疊的槽位合併進同一個維度(bundle)"
+                    )
+
+
+def dim_name(dim: str) -> str:
+    """維度的顯示名:槽位路徑取槽位名,bundle 維度用原名。"""
+    return dim.split(".")[1] if "." in dim else dim
+
+
 def option_name(option: Any) -> str:
     """選項的簡短名稱(組 label 用)。"""
+    if is_bundle(option):
+        if option.get("_label"):
+            return str(option["_label"])
+        return "+".join(  # 沒給 _label 時的後備名:各槽位的選項名串起來
+            f"{dim_name(slot)}:{option_name(opt)}"
+            for slot, opt in option.items()
+            if slot != "_label"
+        )
     if isinstance(option, dict):
         return str(option.get("method", "custom"))
     if isinstance(option, list):
@@ -82,25 +144,30 @@ def option_name(option: Any) -> str:
 
 
 def make_variants(base: dict) -> list[tuple[str, dict, dict]]:
-    """回傳 [(label, overrides, config_dict), ...]。"""
+    """回傳 [(label, overrides, config_dict), ...]。overrides 已展平為
+    {dotted_slot: 選項}(bundle 展開、_label 移除),可直接重現該組合。"""
+    check_dimensions()
     variants = []
     if MODE == "one_at_a_time":
         variants.append(("baseline", {}, copy.deepcopy(base)))
-        for dotted, options in SLOT_OPTIONS.items():
-            slot = dotted.split(".")[1]
+        for dim, options in SLOT_OPTIONS.items():
             for opt in options:
                 cfg = copy.deepcopy(base)
-                apply_option(cfg, dotted, opt)
-                variants.append((f"{slot}={option_name(opt)}", {dotted: opt}, cfg))
+                overrides = resolve_overrides(dim, opt)
+                for dotted, o in overrides.items():
+                    apply_option(cfg, dotted, o)
+                variants.append((f"{dim_name(dim)}={option_name(opt)}", overrides, cfg))
     elif MODE == "product":
-        slots = list(SLOT_OPTIONS)
-        for combo in itertools.product(*(SLOT_OPTIONS[s] for s in slots)):
+        dims = list(SLOT_OPTIONS)
+        for combo in itertools.product(*(SLOT_OPTIONS[d] for d in dims)):
             cfg = copy.deepcopy(base)
-            overrides = dict(zip(slots, combo))
-            for dotted, opt in overrides.items():
-                apply_option(cfg, dotted, opt)
+            overrides: dict[str, Any] = {}
+            for dim, opt in zip(dims, combo):
+                overrides.update(resolve_overrides(dim, opt))
+            for dotted, o in overrides.items():
+                apply_option(cfg, dotted, o)
             label = " + ".join(
-                f"{d.split('.')[1]}={option_name(o)}" for d, o in overrides.items()
+                f"{dim_name(d)}={option_name(o)}" for d, o in zip(dims, combo)
             )
             variants.append((label, overrides, cfg))
     else:
